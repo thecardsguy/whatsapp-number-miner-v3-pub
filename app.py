@@ -4,30 +4,28 @@ WhatsApp Number Miner - zero-cost US mobile WhatsApp number extractor.
 Streams NANPA public data, classifies wireless carriers, probes via self-hosted
 GOWA v9.8.0 with anti-ban pacing. Single-file FastAPI backend.
 
-FIXES APPLIED (v3.3):
+FIXES APPLIED (v3.3.2):
+  1. 8-minute self keep-alive background loop pinging /health so Render free tier
+     does not spin down after 15 minutes of inactivity.
+  2. Startup auto-seed for NPA 732: loads seed_732.json if present (<1s), or
+     auto-ingests NPA 732 in a background thread on boot if wireless_blocks is empty,
+     and caches seed_732.json in DATA_DIR.
+  3. /api/backup/blocks (format=json|csv) and /api/backup/status endpoints for
+     exporting public NANPA wireless_blocks snapshots directly to Files/backups/.
+
+FIXES APPLIED (v3.3.1):
   1. SQLite thread safety: ingest_nanpa_data_sync opens its own dedicated
      connection instead of sharing _db_conn across threads; closes in finally.
   2. Shared _db_conn writes wrapped in _db_lock throughout sampler + API routes.
   3. GOWA QR & pair-code proxy endpoints: /api/devices/{id}/login-qr,
      /api/devices/{id}/login-code, /api/devices/{id}/logout.
-
-FIXES APPLIED (v3.2):
-  1. DB path: sqlite:////app/data/miner.db (persistent volume)
-  2. SQLite: single persistent connection with threading.Lock()
-  3. GOWA auth: random at boot, start.sh exports same var
-  4. Probe selection: exact set-difference, no random-guess false-complete
-  5. Chatter: phone_number column, sends to actual phone number
-  6. Port 3000: bound to 127.0.0.1 only
-  7. Postgres: proper error message
-  8. Temp files: use /app/data instead of /tmp
-  9. DATA_DIR: handle relative paths safely
-  10. Daily quota: no waste on no-op transitions
-  11. Jinja2 removed: serve HTML directly (avoids unhashable dict bug)
+  4. generate_csrf_token wrapped in _db_lock.
 """
 
 import asyncio
 import csv
 import io
+import json
 import logging
 import os
 import random
@@ -51,7 +49,9 @@ APP_KEY = os.getenv("APP_PASSWORD", "")
 GOWA_URL = os.getenv("GOWA_URL", "http://127.0.0.1:3000")
 GOWA_CREDS = os.getenv("GOWA_BASIC_AUTH", "")
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:////app/data/miner.db")
-TARGET_NPA = os.getenv("TARGET_NPA", "")
+TARGET_NPA = os.getenv("TARGET_NPA", "732") or "732"
+KEEP_ALIVE_URL = os.getenv("RENDER_EXTERNAL_URL", "https://whatsapp-number-miner.onrender.com")
+KEEP_ALIVE_INTERVAL = int(os.getenv("KEEP_ALIVE_INTERVAL", "480"))  # 8 minutes
 
 if not APP_KEY:
     raise RuntimeError("APP_PASSWORD environment variable is required")
@@ -231,6 +231,49 @@ def init_db():
     return db
 
 
+def seed_from_json_if_empty(npa_target: str = "732") -> int:
+    """Fast startup seed from seed_732.json if wireless_blocks is empty."""
+    db = get_db()
+    count = db.execute("SELECT COUNT(*) as c FROM wireless_blocks WHERE npa = ?", (npa_target,)).fetchone()["c"]
+    if count > 0:
+        return count
+
+    candidates = [
+        Path(__file__).parent / f"seed_{npa_target}.json",
+        Path(DATA_DIR) / f"seed_{npa_target}.json",
+        Path(__file__).parent / "backups" / f"npa_{npa_target}_wireless_blocks.json",
+    ]
+    for seed_path in candidates:
+        if seed_path.exists():
+            try:
+                payload = json.loads(seed_path.read_text(encoding="utf-8"))
+                blocks = payload.get("blocks", payload) if isinstance(payload, dict) else payload
+                inserted = 0
+                with _db_lock:
+                    for b in blocks:
+                        db.execute(
+                            """INSERT OR IGNORE INTO wireless_blocks
+                               (npa, nxx, block, ocn, company_name, source, status)
+                               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                            (
+                                b.get("npa", npa_target),
+                                b["nxx"],
+                                str(b["block"]),
+                                b.get("ocn"),
+                                b.get("company_name"),
+                                b.get("source", "seed_json"),
+                                b.get("status", "PENDING"),
+                            ),
+                        )
+                        inserted += 1
+                    db.commit()
+                log.info(f"Auto-seeded {inserted} blocks for NPA {npa_target} from {seed_path}")
+                return inserted
+            except Exception as e:
+                log.warning(f"Failed reading seed file {seed_path}: {e}")
+    return 0
+
+
 def is_wireless_ocn(ocn: str, company_name: str, db: sqlite3.Connection) -> bool:
     row = db.execute(
         "SELECT is_wireless FROM ocn_overrides WHERE ocn = ?", (ocn,)
@@ -282,12 +325,13 @@ def generate_csrf_token() -> str:
     import secrets
     token = secrets.token_urlsafe(32)
     db = get_db()
-    db.execute("INSERT OR REPLACE INTO csrf_tokens (token) VALUES (?)", (token,))
-    db.execute(
-        "DELETE FROM csrf_tokens WHERE token NOT IN "
-        "(SELECT token FROM csrf_tokens ORDER BY created_at DESC LIMIT 100)"
-    )
-    db.commit()
+    with _db_lock:
+        db.execute("INSERT OR REPLACE INTO csrf_tokens (token) VALUES (?)", (token,))
+        db.execute(
+            "DELETE FROM csrf_tokens WHERE token NOT IN "
+            "(SELECT token FROM csrf_tokens ORDER BY created_at DESC LIMIT 100)"
+        )
+        db.commit()
     return token
 
 
@@ -387,7 +431,7 @@ class GowaClient:
 
 gowa = GowaClient()
 
-# ── NANPA Streaming Parser ─────────────────────���────────────────────────────
+# ── NANPA Streaming Parser ─────────────────────────────────────────────────
 
 def _stream_zip_to_temp(url: str) -> str:
     import urllib.request
@@ -404,7 +448,6 @@ def _stream_zip_to_temp(url: str) -> str:
 
 
 def parse_co_codes_stream(npa_target: str, db: sqlite3.Connection):
-    import urllib.request
     stats = {"total_lines": 0, "assigned": 0, "wireless": 0}
     log.info(f"Downloading CO codes from {CO_CODES_URL}")
     tmp_path = _stream_zip_to_temp(CO_CODES_URL)
@@ -457,7 +500,6 @@ def parse_co_codes_stream(npa_target: str, db: sqlite3.Connection):
 
 
 def parse_thousands_stream(npa_target: str, db: sqlite3.Connection):
-    import urllib.request
     stats = {"total_lines": 0, "assigned_blocks": 0, "wireless_blocks": 0}
     log.info(f"Downloading thousands-block from {THOUSANDS_URL}")
     tmp_path = _stream_zip_to_temp(THOUSANDS_URL)
@@ -500,11 +542,7 @@ def parse_thousands_stream(npa_target: str, db: sqlite3.Connection):
 
 
 def ingest_nanpa_data_sync(npa_target: str, db: sqlite3.Connection = None) -> dict:
-    """Ingest NANPA data using a dedicated SQLite connection (thread-safe).
-    
-    Opens its own connection via _open_db() instead of sharing the main
-    event loop's _db_conn across threads. Closes in finally: block.
-    """
+    """Ingest NANPA data using a dedicated SQLite connection (thread-safe)."""
     conn = _open_db()
     try:
         wireless_blocks = {}
@@ -564,6 +602,24 @@ def ingest_nanpa_data_sync(npa_target: str, db: sqlite3.Connection = None) -> di
                     pass
 
         conn.commit()
+
+        # Save local seed cache in DATA_DIR
+        try:
+            rows = [
+                dict(r) for r in conn.execute(
+                    "SELECT npa, nxx, block, ocn, company_name, source, status "
+                    "FROM wireless_blocks WHERE npa = ? ORDER BY nxx, block",
+                    (npa_target,),
+                ).fetchall()
+            ]
+            seed_cache = Path(DATA_DIR) / f"seed_{npa_target}.json"
+            seed_cache.write_text(
+                json.dumps({"npa": npa_target, "total": len(rows), "blocks": rows}),
+                encoding="utf-8",
+            )
+        except Exception as e:
+            log.warning(f"Could not write seed cache: {e}")
+
         log.info(f"Ingested {inserted} new wireless blocks for NPA {npa_target} "
                  f"({skipped_existing} already existed)")
         return {
@@ -606,7 +662,7 @@ class BlockSampler:
 
     def _is_night_hours(self) -> bool:
         now_utc = datetime.now(timezone.utc)
-        npa = TARGET_NPA or "212"
+        npa = TARGET_NPA or "732"
         offset = -5
         if npa[0] in "89":
             offset = -8
@@ -945,6 +1001,36 @@ class BlockSampler:
 
 sampler = BlockSampler()
 
+# ── Keep-Alive & Auto-Seed Background Tasks ─────────────────────────────────
+
+async def _keep_alive_loop():
+    """Ping external /health every 8 minutes so Render free tier stays warm."""
+    url = f"{KEEP_ALIVE_URL.rstrip('/')}/health"
+    log.info(f"Keep-alive task started: pinging {url} every {KEEP_ALIVE_INTERVAL}s")
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        while True:
+            try:
+                await asyncio.sleep(KEEP_ALIVE_INTERVAL)
+                resp = await client.get(url)
+                log.info(f"Keep-alive ping {url} -> HTTP {resp.status_code}")
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                log.warning(f"Keep-alive ping failed: {e}")
+
+
+async def _startup_auto_seed():
+    """Ensure TARGET_NPA (default 732) blocks are present on startup."""
+    try:
+        npa = TARGET_NPA or "732"
+        seeded = seed_from_json_if_empty(npa)
+        if seeded == 0:
+            log.info(f"No blocks found for NPA {npa} on startup — auto-ingesting from NANPA...")
+            await asyncio.to_thread(ingest_nanpa_data_sync, npa)
+    except Exception as e:
+        log.error(f"Startup auto-seed failed: {e}", exc_info=True)
+
+
 # ── HTML template (served directly, no Jinja2) ──────────────────────────────
 _HTML_TEMPLATE = None
 
@@ -963,12 +1049,16 @@ def _load_html_template() -> str:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    seed_task = asyncio.create_task(_startup_auto_seed())
+    ka_task = asyncio.create_task(_keep_alive_loop())
     await sampler.start()
     yield
+    ka_task.cancel()
+    seed_task.cancel()
     await sampler.stop()
     await gowa.close()
 
-app = FastAPI(title="WhatsApp Number Miner", version="3.3.0", lifespan=lifespan)
+app = FastAPI(title="WhatsApp Number Miner", version="3.3.2", lifespan=lifespan)
 
 # ── Routes ──────────────────────────────────────────────────────────────────
 
@@ -976,8 +1066,13 @@ app = FastAPI(title="WhatsApp Number Miner", version="3.3.0", lifespan=lifespan)
 async def health():
     try:
         db = get_db()
-        db.execute("SELECT 1")
-        return {"status": "ok", "timestamp": datetime.now(timezone.utc).isoformat()}
+        count = db.execute("SELECT COUNT(*) as c FROM wireless_blocks").fetchone()["c"]
+        return {
+            "status": "ok",
+            "version": "3.3.2",
+            "blocks_loaded": count,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
     except Exception as e:
         return JSONResponse({"status": "error", "detail": str(e)}, status_code=503)
 
@@ -992,6 +1087,72 @@ async def dashboard():
 @app.get("/api/csrf-token")
 async def get_csrf_token(username: str = Depends(verify_credentials)):
     return {"csrf_token": generate_csrf_token()}
+
+@app.get("/api/backup/status")
+async def backup_status(npa: str = Query("732")):
+    """Snapshot status metadata for public NANPA wireless_blocks."""
+    db = get_db()
+    total = db.execute(
+        "SELECT COUNT(*) as c FROM wireless_blocks WHERE npa = ?", (npa,)
+    ).fetchone()["c"]
+    by_source = {
+        r["source"]: r["c"]
+        for r in db.execute(
+            "SELECT source, COUNT(*) as c FROM wireless_blocks WHERE npa = ? GROUP BY source",
+            (npa,),
+        ).fetchall()
+    }
+    return {
+        "status": "ok",
+        "version": "3.3.2",
+        "npa": npa,
+        "total_wireless_blocks": total,
+        "by_source": by_source,
+        "keep_alive_interval_s": KEEP_ALIVE_INTERVAL,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+@app.get("/api/backup/blocks")
+async def backup_blocks(
+    npa: str = Query("732"),
+    format: str = Query("json", pattern="^(json|csv)$"),
+):
+    """Export public NANPA wireless_blocks table as JSON or CSV for Files/backups/."""
+    db = get_db()
+    rows = [
+        dict(r) for r in db.execute(
+            "SELECT npa, nxx, block, ocn, company_name, source, status, "
+            "sample_hits, sample_total, numbers_checked, numbers_found "
+            "FROM wireless_blocks WHERE npa = ? ORDER BY nxx ASC, block ASC",
+            (npa,),
+        ).fetchall()
+    ]
+    if format == "csv":
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow([
+            "npa", "nxx", "block", "ocn", "company_name", "source",
+            "status", "sample_hits", "sample_total", "numbers_checked", "numbers_found"
+        ])
+        for r in rows:
+            writer.writerow([
+                r["npa"], r["nxx"], r["block"], r["ocn"] or "",
+                r["company_name"] or "", r["source"] or "", r["status"] or "",
+                r["sample_hits"], r["sample_total"], r["numbers_checked"], r["numbers_found"],
+            ])
+        output.seek(0)
+        return StreamingResponse(
+            iter([output.getvalue()]),
+            media_type="text/csv",
+            headers={"Content-Disposition": f"attachment; filename=npa_{npa}_wireless_blocks.csv"},
+        )
+    return {
+        "npa": npa,
+        "version": "3.3.2",
+        "total": len(rows),
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "blocks": rows,
+    }
 
 @app.get("/api/stats")
 async def get_stats(username: str = Depends(verify_credentials)):
@@ -1033,7 +1194,6 @@ async def ingest_npa(
     if not re.match(r"^\d{3}$", npa):
         raise HTTPException(400, "NPA must be exactly 3 digits")
     try:
-        # ingest_nanpa_data_sync opens its own dedicated connection (thread-safe)
         result = await asyncio.to_thread(ingest_nanpa_data_sync, npa)
         return {"status": "ok", **result}
     except Exception as e:
@@ -1148,7 +1308,6 @@ async def remove_device(device_id: str, username: str = Depends(verify_csrf)):
 
 @app.post("/api/devices/{device_id}/login-qr")
 async def device_login_qr(device_id: str, username: str = Depends(verify_csrf)):
-    """Proxy: GET /app/login on GOWA with X-Device-Id, returns QR code data."""
     try:
         result = await gowa.login_qr(device_id)
         return result
@@ -1162,7 +1321,6 @@ async def device_login_code(
     phone: str = Query(..., description="Phone number for pair code"),
     username: str = Depends(verify_csrf),
 ):
-    """Proxy: GET /app/login-with-code on GOWA, returns pairing code."""
     try:
         result = await gowa.login_code(phone, device_id)
         return result
@@ -1172,7 +1330,6 @@ async def device_login_code(
 
 @app.post("/api/devices/{device_id}/logout")
 async def device_logout(device_id: str, username: str = Depends(verify_csrf)):
-    """Proxy: GET /app/logout on GOWA, logs out the device."""
     try:
         result = await gowa.logout_device(device_id)
         return result

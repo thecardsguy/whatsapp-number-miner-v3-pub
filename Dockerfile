@@ -16,12 +16,13 @@ COPY --from=gowa /app/whatsapp /app/whatsapp
 
 # Set up app with persistent data directory
 WORKDIR /app
-RUN mkdir -p /app/data /app/storages
+RUN mkdir -p /app/data /app/storages /app/backups
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app.py .
 COPY templates/ templates/
+COPY backups/ backups/
 
 # Startup script
 COPY start.sh /app/start.sh
