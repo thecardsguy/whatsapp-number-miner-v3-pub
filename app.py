@@ -4,6 +4,13 @@ WhatsApp Number Miner - zero-cost US mobile WhatsApp number extractor.
 Streams NANPA public data, classifies wireless carriers, probes via self-hosted
 GOWA v9.8.0 with anti-ban pacing. Single-file FastAPI backend.
 
+FIXES APPLIED (v3.3):
+  1. SQLite thread safety: ingest_nanpa_data_sync opens its own dedicated
+     connection instead of sharing _db_conn across threads; closes in finally.
+  2. Shared _db_conn writes wrapped in _db_lock throughout sampler + API routes.
+  3. GOWA QR & pair-code proxy endpoints: /api/devices/{id}/login-qr,
+     /api/devices/{id}/login-code, /api/devices/{id}/logout.
+
 FIXES APPLIED (v3.2):
   1. DB path: sqlite:////app/data/miner.db (persistent volume)
   2. SQLite: single persistent connection with threading.Lock()
@@ -240,7 +247,7 @@ def is_wireless_ocn(ocn: str, company_name: str, db: sqlite3.Connection) -> bool
     return False
 
 
-# ── Auth & CSRF ─────────��───────────────────────────────────────────────────
+# ── Auth & CSRF ─────────────────────────────────────────────────────────────
 security = HTTPBasic(auto_error=False)
 
 def verify_credentials(credentials: HTTPBasicCredentials = Depends(security)):
@@ -349,6 +356,30 @@ class GowaClient:
             log.warning(f"Failed to list GOWA devices: {e}")
             return []
 
+    async def login_qr(self, device_id: str) -> dict:
+        """GET /app/login with X-Device-Id header, returns QR code data."""
+        client = await self._get_client()
+        headers = {"X-Device-Id": device_id}
+        resp = await client.get("/app/login", headers=headers)
+        resp.raise_for_status()
+        return resp.json()
+
+    async def login_code(self, phone: str, device_id: str) -> dict:
+        """GET /app/login-with-code with phone param and X-Device-Id header."""
+        client = await self._get_client()
+        headers = {"X-Device-Id": device_id}
+        resp = await client.get("/app/login-with-code", params={"phone": phone}, headers=headers)
+        resp.raise_for_status()
+        return resp.json()
+
+    async def logout_device(self, device_id: str) -> dict:
+        """GET /app/logout with X-Device-Id header."""
+        client = await self._get_client()
+        headers = {"X-Device-Id": device_id}
+        resp = await client.get("/app/logout", headers=headers)
+        resp.raise_for_status()
+        return resp.json()
+
     async def close(self):
         if self._client:
             await self._client.aclose()
@@ -356,7 +387,7 @@ class GowaClient:
 
 gowa = GowaClient()
 
-# ── NANPA Streaming Parser ──────────────────────────────────────────────────
+# ── NANPA Streaming Parser ─────────────────────���────────────────────────────
 
 def _stream_zip_to_temp(url: str) -> str:
     import urllib.request
@@ -468,76 +499,85 @@ def parse_thousands_stream(npa_target: str, db: sqlite3.Connection):
     return stats
 
 
-def ingest_nanpa_data_sync(npa_target: str, db: sqlite3.Connection) -> dict:
-    wireless_blocks = {}
-    wireless_nxx_from_co = set()
+def ingest_nanpa_data_sync(npa_target: str, db: sqlite3.Connection = None) -> dict:
+    """Ingest NANPA data using a dedicated SQLite connection (thread-safe).
+    
+    Opens its own connection via _open_db() instead of sharing the main
+    event loop's _db_conn across threads. Closes in finally: block.
+    """
+    conn = _open_db()
+    try:
+        wireless_blocks = {}
+        wireless_nxx_from_co = set()
 
-    tb_stats = {"total_lines": 0, "assigned_blocks": 0, "wireless_blocks": 0}
-    for entry in parse_thousands_stream(npa_target, db):
-        tb_stats["total_lines"] += 1
-        tb_stats["assigned_blocks"] += 1
-        tb_stats["wireless_blocks"] += 1
-        key = (entry["nxx"], entry["block"])
-        if key not in wireless_blocks:
-            wireless_blocks[key] = entry
-    log.info(f"Thousands-block: {tb_stats}")
+        tb_stats = {"total_lines": 0, "assigned_blocks": 0, "wireless_blocks": 0}
+        for entry in parse_thousands_stream(npa_target, conn):
+            tb_stats["total_lines"] += 1
+            tb_stats["assigned_blocks"] += 1
+            tb_stats["wireless_blocks"] += 1
+            key = (entry["nxx"], entry["block"])
+            if key not in wireless_blocks:
+                wireless_blocks[key] = entry
+        log.info(f"Thousands-block: {tb_stats}")
 
-    co_stats = {"total_lines": 0, "assigned": 0, "wireless": 0}
-    for entry in parse_co_codes_stream(npa_target, db):
-        co_stats["total_lines"] += 1
-        co_stats["assigned"] += 1
-        co_stats["wireless"] += 1
-        wireless_nxx_from_co.add(entry["nxx"])
-    log.info(f"CO codes: {co_stats}")
+        co_stats = {"total_lines": 0, "assigned": 0, "wireless": 0}
+        for entry in parse_co_codes_stream(npa_target, conn):
+            co_stats["total_lines"] += 1
+            co_stats["assigned"] += 1
+            co_stats["wireless"] += 1
+            wireless_nxx_from_co.add(entry["nxx"])
+        log.info(f"CO codes: {co_stats}")
 
-    nxx_with_blocks = {b[0] for b in wireless_blocks}
-    inserted = 0
-    skipped_existing = 0
+        nxx_with_blocks = {b[0] for b in wireless_blocks}
+        inserted = 0
+        skipped_existing = 0
 
-    for (nxx, block), entry in wireless_blocks.items():
-        try:
-            db.execute(
-                """INSERT OR IGNORE INTO wireless_blocks
-                   (npa, nxx, block, ocn, company_name, source, status)
-                   VALUES (?, ?, ?, ?, ?, ?, 'PENDING')""",
-                (npa_target, nxx, block, entry["ocn"], entry["company_name"], entry["source"]),
-            )
-            if db.total_changes > 0:
-                inserted += 1
-            else:
-                skipped_existing += 1
-        except Exception:
-            pass
-
-    for nxx in sorted(wireless_nxx_from_co):
-        if nxx in nxx_with_blocks:
-            continue
-        for block in range(10):
+        for (nxx, block), entry in wireless_blocks.items():
             try:
-                db.execute(
+                conn.execute(
                     """INSERT OR IGNORE INTO wireless_blocks
-                       (npa, nxx, block, source, status)
-                       VALUES (?, ?, ?, 'co_codes_backfill', 'PENDING')""",
-                    (npa_target, nxx, str(block)),
+                       (npa, nxx, block, ocn, company_name, source, status)
+                       VALUES (?, ?, ?, ?, ?, ?, 'PENDING')""",
+                    (npa_target, nxx, block, entry["ocn"], entry["company_name"], entry["source"]),
                 )
-                if db.total_changes > 0:
+                if conn.total_changes > 0:
                     inserted += 1
+                else:
+                    skipped_existing += 1
             except Exception:
                 pass
 
-    db.commit()
-    log.info(f"Ingested {inserted} new wireless blocks for NPA {npa_target} "
-             f"({skipped_existing} already existed)")
-    return {
-        "npa": npa_target,
-        "wireless_blocks_inserted": inserted,
-        "skipped_existing": skipped_existing,
-        "thousands_wireless_blocks": tb_stats["wireless_blocks"],
-        "co_codes_wireless_nxx": len(wireless_nxx_from_co),
-    }
+        for nxx in sorted(wireless_nxx_from_co):
+            if nxx in nxx_with_blocks:
+                continue
+            for block in range(10):
+                try:
+                    conn.execute(
+                        """INSERT OR IGNORE INTO wireless_blocks
+                           (npa, nxx, block, source, status)
+                           VALUES (?, ?, ?, 'co_codes_backfill', 'PENDING')""",
+                        (npa_target, nxx, str(block)),
+                    )
+                    if conn.total_changes > 0:
+                        inserted += 1
+                except Exception:
+                    pass
+
+        conn.commit()
+        log.info(f"Ingested {inserted} new wireless blocks for NPA {npa_target} "
+                 f"({skipped_existing} already existed)")
+        return {
+            "npa": npa_target,
+            "wireless_blocks_inserted": inserted,
+            "skipped_existing": skipped_existing,
+            "thousands_wireless_blocks": tb_stats["wireless_blocks"],
+            "co_codes_wireless_nxx": len(wireless_nxx_from_co),
+        }
+    finally:
+        conn.close()
 
 
-# ── Block Sampler ──────────────────────────────────────────────────���────────
+# ── Block Sampler ───────────────────────────────────────────────────────────
 
 class BlockSampler:
     def __init__(self):
@@ -710,13 +750,14 @@ class BlockSampler:
         if is_wa:
             self.stats["numbers_found"] += 1
 
-        db.execute(
-            "INSERT OR REPLACE INTO number_probes "
-            "(phone, npa, nxx, block, is_on_whatsapp, device_id) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (phone, npa, nxx, blk, int(is_wa), device["device_id"]),
-        )
-        db.commit()
+        with _db_lock:
+            db.execute(
+                "INSERT OR REPLACE INTO number_probes "
+                "(phone, npa, nxx, block, is_on_whatsapp, device_id) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (phone, npa, nxx, blk, int(is_wa), device["device_id"]),
+            )
+            db.commit()
 
         if existing + 1 >= SAMPLE_SIZE:
             self._finalize_sample_block(npa, nxx, blk, db)
@@ -734,29 +775,30 @@ class BlockSampler:
             (npa, nxx, blk),
         ).fetchone()["c"]
 
-        db.execute(
-            """UPDATE wireless_blocks SET sample_hits=?, sample_total=?,
-               numbers_checked=?, numbers_found=?, updated_at=datetime('now')
-               WHERE npa=? AND nxx=? AND block=?""",
-            (hits, SAMPLE_SIZE, total, hits, npa, nxx, blk),
-        )
+        with _db_lock:
+            db.execute(
+                """UPDATE wireless_blocks SET sample_hits=?, sample_total=?,
+                   numbers_checked=?, numbers_found=?, updated_at=datetime('now')
+                   WHERE npa=? AND nxx=? AND block=?""",
+                (hits, SAMPLE_SIZE, total, hits, npa, nxx, blk),
+            )
 
-        if hits == 0:
-            db.execute(
-                "UPDATE wireless_blocks SET status='DORMANT_SKIPPED', "
-                "updated_at=datetime('now') WHERE npa=? AND nxx=? AND block=?",
-                (npa, nxx, blk),
-            )
-            self.stats["blocks_skipped"] += 1
-            self.stats["queries_saved"] += 980
-        else:
-            db.execute(
-                "UPDATE wireless_blocks SET status='ACTIVE_SWEEPING', "
-                "updated_at=datetime('now') WHERE npa=? AND nxx=? AND block=?",
-                (npa, nxx, blk),
-            )
-            self.stats["blocks_sweeping"] += 1
-        db.commit()
+            if hits == 0:
+                db.execute(
+                    "UPDATE wireless_blocks SET status='DORMANT_SKIPPED', "
+                    "updated_at=datetime('now') WHERE npa=? AND nxx=? AND block=?",
+                    (npa, nxx, blk),
+                )
+                self.stats["blocks_skipped"] += 1
+                self.stats["queries_saved"] += 980
+            else:
+                db.execute(
+                    "UPDATE wireless_blocks SET status='ACTIVE_SWEEPING', "
+                    "updated_at=datetime('now') WHERE npa=? AND nxx=? AND block=?",
+                    (npa, nxx, blk),
+                )
+                self.stats["blocks_sweeping"] += 1
+            db.commit()
 
     async def _probe_one_sweep(self, block: dict, device: dict, db: sqlite3.Connection) -> bool:
         npa, nxx, blk = block["npa"], block["nxx"], block["block"]
@@ -777,13 +819,14 @@ class BlockSampler:
                 (npa, nxx, blk),
             ).fetchone()["c"]
             total = len(probed)
-            db.execute(
-                """UPDATE wireless_blocks SET status='COMPLETE',
-                   numbers_checked=?, numbers_found=?, updated_at=datetime('now')
-                   WHERE npa=? AND nxx=? AND block=?""",
-                (total, hits, npa, nxx, blk),
-            )
-            db.commit()
+            with _db_lock:
+                db.execute(
+                    """UPDATE wireless_blocks SET status='COMPLETE',
+                       numbers_checked=?, numbers_found=?, updated_at=datetime('now')
+                       WHERE npa=? AND nxx=? AND block=?""",
+                    (total, hits, npa, nxx, blk),
+                )
+                db.commit()
             self.stats["blocks_complete"] += 1
             return False
 
@@ -801,22 +844,24 @@ class BlockSampler:
         if is_wa:
             self.stats["numbers_found"] += 1
 
-        db.execute(
-            "INSERT OR REPLACE INTO number_probes "
-            "(phone, npa, nxx, block, is_on_whatsapp, device_id) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (phone, npa, nxx, blk, int(is_wa), device["device_id"]),
-        )
-        db.commit()
+        with _db_lock:
+            db.execute(
+                "INSERT OR REPLACE INTO number_probes "
+                "(phone, npa, nxx, block, is_on_whatsapp, device_id) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (phone, npa, nxx, blk, int(is_wa), device["device_id"]),
+            )
+            db.commit()
         return True
 
     def _trigger_cooldown(self, device_id: str, db: sqlite3.Connection):
         until = (datetime.now(timezone.utc) + timedelta(hours=COOLDOWN_HOURS)).isoformat()
-        db.execute(
-            "UPDATE gowa_devices SET status='COOLDOWN_463', cooldown_until=? WHERE device_id=?",
-            (until, device_id),
-        )
-        db.commit()
+        with _db_lock:
+            db.execute(
+                "UPDATE gowa_devices SET status='COOLDOWN_463', cooldown_until=? WHERE device_id=?",
+                (until, device_id),
+            )
+            db.commit()
         log.warning(f"Device {device_id} tripped COOLDOWN_463 until {until}")
 
     def _update_daily_counter(self, device_id: str, db: sqlite3.Connection):
@@ -827,19 +872,20 @@ class BlockSampler:
         ).fetchone()
         if not dev:
             return
-        if dev["daily_check_date"] == today:
-            db.execute(
-                "UPDATE gowa_devices SET daily_checks=daily_checks+1, "
-                "last_check_at=datetime('now') WHERE device_id=?",
-                (device_id,),
-            )
-        else:
-            db.execute(
-                "UPDATE gowa_devices SET daily_checks=1, daily_check_date=?, "
-                "last_check_at=datetime('now') WHERE device_id=?",
-                (today, device_id),
-            )
-        db.commit()
+        with _db_lock:
+            if dev["daily_check_date"] == today:
+                db.execute(
+                    "UPDATE gowa_devices SET daily_checks=daily_checks+1, "
+                    "last_check_at=datetime('now') WHERE device_id=?",
+                    (device_id,),
+                )
+            else:
+                db.execute(
+                    "UPDATE gowa_devices SET daily_checks=1, daily_check_date=?, "
+                    "last_check_at=datetime('now') WHERE device_id=?",
+                    (today, device_id),
+                )
+            db.commit()
 
     def _update_device_age(self, db: sqlite3.Connection):
         devices = db.execute(
@@ -849,23 +895,24 @@ class BlockSampler:
             dev = dict(dev)
             created = datetime.fromisoformat(dev["created_at"])
             age_days = (datetime.now(timezone.utc) - created).days
-            db.execute(
-                "UPDATE gowa_devices SET age_days=? WHERE device_id=?",
-                (age_days, dev["device_id"]),
-            )
-            if age_days >= 8 and dev["status"] != "MATURE":
+            with _db_lock:
                 db.execute(
-                    "UPDATE gowa_devices SET status='MATURE' WHERE device_id=?",
-                    (dev["device_id"],),
+                    "UPDATE gowa_devices SET age_days=? WHERE device_id=?",
+                    (age_days, dev["device_id"]),
                 )
-                log.info(f"Device {dev['device_id']} promoted to MATURE (age {age_days}d)")
-            elif age_days >= 4 and dev["status"] == "NEW":
-                db.execute(
-                    "UPDATE gowa_devices SET status='WARMING' WHERE device_id=?",
-                    (dev["device_id"],),
-                )
-                log.info(f"Device {dev['device_id']} promoted to WARMING (age {age_days}d)")
-        db.commit()
+                if age_days >= 8 and dev["status"] != "MATURE":
+                    db.execute(
+                        "UPDATE gowa_devices SET status='MATURE' WHERE device_id=?",
+                        (dev["device_id"],),
+                    )
+                    log.info(f"Device {dev['device_id']} promoted to MATURE (age {age_days}d)")
+                elif age_days >= 4 and dev["status"] == "NEW":
+                    db.execute(
+                        "UPDATE gowa_devices SET status='WARMING' WHERE device_id=?",
+                        (dev["device_id"],),
+                    )
+                    log.info(f"Device {dev['device_id']} promoted to WARMING (age {age_days}d)")
+                db.commit()
 
     async def _run(self):
         log.info("Block Sampler worker started")
@@ -921,7 +968,7 @@ async def lifespan(app: FastAPI):
     await sampler.stop()
     await gowa.close()
 
-app = FastAPI(title="WhatsApp Number Miner", version="3.2.0", lifespan=lifespan)
+app = FastAPI(title="WhatsApp Number Miner", version="3.3.0", lifespan=lifespan)
 
 # ── Routes ──────────────────────────────────────────────────────────────────
 
@@ -985,9 +1032,9 @@ async def ingest_npa(
 ):
     if not re.match(r"^\d{3}$", npa):
         raise HTTPException(400, "NPA must be exactly 3 digits")
-    db = get_db()
     try:
-        result = await asyncio.to_thread(ingest_nanpa_data_sync, npa, db)
+        # ingest_nanpa_data_sync opens its own dedicated connection (thread-safe)
+        result = await asyncio.to_thread(ingest_nanpa_data_sync, npa)
         return {"status": "ok", **result}
     except Exception as e:
         log.error(f"Ingestion failed: {e}", exc_info=True)
@@ -1078,12 +1125,13 @@ async def add_device(
 ):
     db = get_db()
     try:
-        db.execute(
-            "INSERT OR REPLACE INTO gowa_devices "
-            "(device_id, phone_number, proxy_url, status) VALUES (?, ?, ?, 'NEW')",
-            (device_id, phone_number, proxy_url),
-        )
-        db.commit()
+        with _db_lock:
+            db.execute(
+                "INSERT OR REPLACE INTO gowa_devices "
+                "(device_id, phone_number, proxy_url, status) VALUES (?, ?, ?, 'NEW')",
+                (device_id, phone_number, proxy_url),
+            )
+            db.commit()
         return {"status": "ok", "device_id": device_id}
     except Exception as e:
         raise HTTPException(400, str(e))
@@ -1091,9 +1139,46 @@ async def add_device(
 @app.delete("/api/devices/{device_id}")
 async def remove_device(device_id: str, username: str = Depends(verify_csrf)):
     db = get_db()
-    db.execute("DELETE FROM gowa_devices WHERE device_id = ?", (device_id,))
-    db.commit()
+    with _db_lock:
+        db.execute("DELETE FROM gowa_devices WHERE device_id = ?", (device_id,))
+        db.commit()
     return {"status": "ok"}
+
+# ── GOWA QR & Pair-Code Proxy Endpoints ─────────────────────────────────────
+
+@app.post("/api/devices/{device_id}/login-qr")
+async def device_login_qr(device_id: str, username: str = Depends(verify_csrf)):
+    """Proxy: GET /app/login on GOWA with X-Device-Id, returns QR code data."""
+    try:
+        result = await gowa.login_qr(device_id)
+        return result
+    except Exception as e:
+        log.error(f"GOWA login_qr failed for {device_id}: {e}")
+        raise HTTPException(502, f"GOWA error: {e}")
+
+@app.post("/api/devices/{device_id}/login-code")
+async def device_login_code(
+    device_id: str,
+    phone: str = Query(..., description="Phone number for pair code"),
+    username: str = Depends(verify_csrf),
+):
+    """Proxy: GET /app/login-with-code on GOWA, returns pairing code."""
+    try:
+        result = await gowa.login_code(phone, device_id)
+        return result
+    except Exception as e:
+        log.error(f"GOWA login_code failed for {device_id}: {e}")
+        raise HTTPException(502, f"GOWA error: {e}")
+
+@app.post("/api/devices/{device_id}/logout")
+async def device_logout(device_id: str, username: str = Depends(verify_csrf)):
+    """Proxy: GET /app/logout on GOWA, logs out the device."""
+    try:
+        result = await gowa.logout_device(device_id)
+        return result
+    except Exception as e:
+        log.error(f"GOWA logout failed for {device_id}: {e}")
+        raise HTTPException(502, f"GOWA error: {e}")
 
 @app.get("/api/ocn-overrides")
 async def list_ocn_overrides(username: str = Depends(verify_credentials)):
@@ -1107,12 +1192,13 @@ async def set_ocn_override(
     is_wireless: bool = True, username: str = Depends(verify_csrf),
 ):
     db = get_db()
-    db.execute(
-        "INSERT OR REPLACE INTO ocn_overrides (ocn, company_name, is_wireless) "
-        "VALUES (?, ?, ?)",
-        (ocn, company_name, int(is_wireless)),
-    )
-    db.commit()
+    with _db_lock:
+        db.execute(
+            "INSERT OR REPLACE INTO ocn_overrides (ocn, company_name, is_wireless) "
+            "VALUES (?, ?, ?)",
+            (ocn, company_name, int(is_wireless)),
+        )
+        db.commit()
     return {"status": "ok", "ocn": ocn, "is_wireless": is_wireless}
 
 @app.post("/api/sampler/start")
