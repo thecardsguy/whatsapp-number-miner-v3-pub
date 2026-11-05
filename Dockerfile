@@ -11,13 +11,12 @@ RUN apk add --no-cache \
     libwebp \
     tzdata
 
-# Copy GOWA binary and storages from official image
+# Copy GOWA binary from official image (storages dir created at runtime)
 COPY --from=gowa /app/whatsapp /app/whatsapp
-COPY --from=gowa /app/storages /app/storages
 
 # Set up app with persistent data directory
 WORKDIR /app
-RUN mkdir -p /app/data
+RUN mkdir -p /app/data /app/storages
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
