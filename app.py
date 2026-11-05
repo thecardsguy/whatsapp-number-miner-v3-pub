@@ -4,15 +4,7 @@ WhatsApp Number Miner - zero-cost US mobile WhatsApp number extractor.
 Streams NANPA public data, classifies wireless carriers, probes via self-hosted
 GOWA v9.8.0 with anti-ban pacing. Single-file FastAPI backend.
 
-Verified NANPA URLs (2026-11-01):
-  CO Codes:  https://reports.nanpa.com/public/CoCodeAssignment_Utilized_AllStates_Public.zip
-  Thousands: https://reports.nanpa.com/public/ThousandsBlockAssignment_All.zip
-
-GOWA API (verified from openapi.yaml):
-  GET /user/check?phone=1XXXXXXXXXX  (X-Device-Id header)
-  Response: {"results": {"is_on_whatsapp": true/false}}
-
-FIXES APPLIED (v3.1):
+FIXES APPLIED (v3.2):
   1. DB path: sqlite:////app/data/miner.db (persistent volume)
   2. SQLite: single persistent connection with threading.Lock()
   3. GOWA auth: random at boot, start.sh exports same var
@@ -23,6 +15,7 @@ FIXES APPLIED (v3.1):
   8. Temp files: use /app/data instead of /tmp
   9. DATA_DIR: handle relative paths safely
   10. Daily quota: no waste on no-op transitions
+  11. Jinja2 removed: serve HTML directly (avoids unhashable dict bug)
 """
 
 import asyncio
@@ -45,7 +38,6 @@ import httpx
 from fastapi import FastAPI, HTTPException, Request, Depends, Query
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
-from fastapi.templating import Jinja2Templates
 
 # ── Config ──────────────────────────────────────────────────────────────────
 APP_KEY = os.getenv("APP_PASSWORD", "")
@@ -248,7 +240,7 @@ def is_wireless_ocn(ocn: str, company_name: str, db: sqlite3.Connection) -> bool
     return False
 
 
-# ── Auth & CSRF ─────────────────────────────────────────────────────────────
+# ── Auth & CSRF ─────────��───────────────────────────────────────────────────
 security = HTTPBasic(auto_error=False)
 
 def verify_credentials(credentials: HTTPBasicCredentials = Depends(security)):
@@ -545,7 +537,7 @@ def ingest_nanpa_data_sync(npa_target: str, db: sqlite3.Connection) -> dict:
     }
 
 
-# ── Block Sampler ───────────────────────────────────────────────────────────
+# ── Block Sampler ──────────────────────────────────────────────────���────────
 
 class BlockSampler:
     def __init__(self):
@@ -906,6 +898,20 @@ class BlockSampler:
 
 sampler = BlockSampler()
 
+# ── HTML template (served directly, no Jinja2) ──────────────────────────────
+_HTML_TEMPLATE = None
+
+def _load_html_template() -> str:
+    global _HTML_TEMPLATE
+    if _HTML_TEMPLATE is not None:
+        return _HTML_TEMPLATE
+    html_path = Path(__file__).parent / "templates" / "index.html"
+    if html_path.exists():
+        _HTML_TEMPLATE = html_path.read_text(encoding="utf-8")
+    else:
+        _HTML_TEMPLATE = "<html><body><h1>WhatsApp Number Miner</h1><p>Template not found</p></body></html>"
+    return _HTML_TEMPLATE
+
 # ── FastAPI App ─────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -915,11 +921,7 @@ async def lifespan(app: FastAPI):
     await sampler.stop()
     await gowa.close()
 
-app = FastAPI(title="WhatsApp Number Miner", version="3.1.0", lifespan=lifespan)
-
-templates_dir = Path(__file__).parent / "templates"
-templates_dir.mkdir(exist_ok=True)
-templates = Jinja2Templates(directory=str(templates_dir))
+app = FastAPI(title="WhatsApp Number Miner", version="3.2.0", lifespan=lifespan)
 
 # ── Routes ──────────────────────────────────────────────────────────────────
 
@@ -933,9 +935,10 @@ async def health():
         return JSONResponse({"status": "error", "detail": str(e)}, status_code=503)
 
 @app.get("/", response_class=HTMLResponse)
-async def dashboard(request: Request):
+async def dashboard():
     csrf = generate_csrf_token()
-    response = templates.TemplateResponse("index.html", {"request": request})
+    html = _load_html_template()
+    response = HTMLResponse(content=html)
     response.set_cookie(key="csrf_token", value=csrf, httponly=True, samesite="lax")
     return response
 
