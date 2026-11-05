@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: whatsapp-number-miner
+    env: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: PORT
+        value: "8000"
+      - key: APP_PASSWORD
+        sync: false
+      - key: GOWA_BASIC_AUTH
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: TARGET_NPA
+        sync: false

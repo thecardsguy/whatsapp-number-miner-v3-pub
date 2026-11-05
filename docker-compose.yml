@@ -1,0 +1,27 @@
+version: "3.9"
+
+services:
+  miner:
+    build: .
+    ports:
+      - "${PORT:-8000}:8000"
+      # FIXED: GOWA bound strictly to localhost, never exposed on public interface
+      - "127.0.0.1:3000:3000"
+    environment:
+      - PORT=8000
+      - GOWA_URL=http://127.0.0.1:3000
+      - GOWA_BASIC_AUTH=${GOWA_BASIC_AUTH}
+      - APP_PASSWORD=${APP_PASSWORD}
+      - DATABASE_URL=${DATABASE_URL:-sqlite:////app/data/miner.db}
+      - TARGET_NPA=${TARGET_NPA:-}
+    volumes:
+      - miner_data:/app/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+volumes:
+  miner_data:

@@ -1,0 +1,508 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WhatsApp Number Miner v3</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: {
+                extend: {
+                    colors: {
+                        brand: {50:'#eef2ff',100:'#e0e7ff',200:'#c7d2fe',300:'#a5b4fc',400:'#818cf8',500:'#6366f1',600:'#4f46e5',700:'#4338ca',800:'#3730a3',900:'#312e81'}
+                    }
+                }
+            }
+        }
+    </script>
+    <style>
+        .pulse { animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite; }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+        .fade-in { animation: fadeIn 0.3s ease-in; }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: translateY(0); } }
+    </style>
+</head>
+<body class="bg-gray-950 text-gray-100 min-h-screen font-mono">
+    <header class="border-b border-gray-800 bg-gray-900/80 backdrop-blur sticky top-0 z-50">
+        <div class="max-w-7xl mx-auto px-4 py-3 flex items-center justify-between">
+            <div class="flex items-center gap-3">
+                <div class="w-8 h-8 bg-brand-600 rounded-lg flex items-center justify-center text-sm font-bold">W</div>
+                <div>
+                    <h1 class="text-lg font-bold text-white">WhatsApp Number Miner v3</h1>
+                    <p class="text-xs text-gray-500">$0-lookup · GOWA v9.8.0 · NANPA-sourced · Session bursts · Persistent DB</p>
+                </div>
+            </div>
+            <div class="flex items-center gap-3">
+                <span id="samplerBadge" class="px-2 py-1 text-xs rounded-full bg-gray-800 text-gray-400">● Idle</span>
+                <button onclick="login()" id="loginBtn" class="px-3 py-1.5 text-xs bg-brand-600 hover:bg-brand-700 rounded-lg transition">Login</button>
+            </div>
+        </div>
+    </header>
+
+    <main class="max-w-7xl mx-auto px-4 py-6 space-y-6">
+        <!-- Auth Modal -->
+        <div id="authModal" class="hidden fixed inset-0 bg-black/70 flex items-center justify-center z-50">
+            <div class="bg-gray-900 border border-gray-700 rounded-xl p-6 w-96 fade-in">
+                <h2 class="text-lg font-bold mb-4">Authentication</h2>
+                <input id="passwordInput" type="password" placeholder="Password" class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm mb-3 focus:outline-none focus:border-brand-500">
+                <button onclick="doLogin()" class="w-full py-2 bg-brand-600 hover:bg-brand-700 rounded-lg text-sm font-medium transition">Login</button>
+                <p id="authError" class="text-red-400 text-xs mt-2 hidden"></p>
+            </div>
+        </div>
+
+        <!-- Stats Grid -->
+        <div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-3">
+            <div class="bg-gray-900 border border-gray-800 rounded-xl p-4">
+                <p class="text-xs text-gray-500 uppercase tracking-wider">Blocks Total</p>
+                <p id="statBlocksTotal" class="text-2xl font-bold text-white mt-1">-</p>
+            </div>
+            <div class="bg-gray-900 border border-gray-800 rounded-xl p-4">
+                <p class="text-xs text-gray-500 uppercase tracking-wider">Pending</p>
+                <p id="statPending" class="text-2xl font-bold text-yellow-400 mt-1">-</p>
+            </div>
+            <div class="bg-gray-900 border border-gray-800 rounded-xl p-4">
+                <p class="text-xs text-gray-500 uppercase tracking-wider">Sweeping</p>
+                <p id="statSweeping" class="text-2xl font-bold text-blue-400 mt-1">-</p>
+            </div>
+            <div class="bg-gray-900 border border-gray-800 rounded-xl p-4">
+                <p class="text-xs text-gray-500 uppercase tracking-wider">Dormant</p>
+                <p id="statDormant" class="text-2xl font-bold text-gray-500 mt-1">-</p>
+            </div>
+            <div class="bg-gray-900 border border-gray-800 rounded-xl p-4">
+                <p class="text-xs text-gray-500 uppercase tracking-wider">Complete</p>
+                <p id="statComplete" class="text-2xl font-bold text-green-400 mt-1">-</p>
+            </div>
+            <div class="bg-gray-900 border border-brand-800 rounded-xl p-4 bg-brand-950/30">
+                <p class="text-xs text-brand-400 uppercase tracking-wider">WA Found</p>
+                <p id="statWAFound" class="text-2xl font-bold text-brand-400 mt-1">-</p>
+            </div>
+        </div>
+
+        <!-- Sampler Stats -->
+        <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
+            <div class="bg-gray-900/50 border border-gray-800 rounded-lg p-3">
+                <p class="text-xs text-gray-500">Numbers Checked</p>
+                <p id="statChecked" class="text-lg font-bold text-white">-</p>
+            </div>
+            <div class="bg-gray-900/50 border border-gray-800 rounded-lg p-3">
+                <p class="text-xs text-gray-500">Queries Saved</p>
+                <p id="statSaved" class="text-lg font-bold text-green-400">-</p>
+            </div>
+            <div class="bg-gray-900/50 border border-gray-800 rounded-lg p-3">
+                <p class="text-xs text-gray-500">Blocks Skipped</p>
+                <p id="statSkipped" class="text-lg font-bold text-gray-400">-</p>
+            </div>
+            <div class="bg-gray-900/50 border border-gray-800 rounded-lg p-3">
+                <p class="text-xs text-gray-500">Current Device</p>
+                <p id="statDevice" class="text-lg font-bold text-white truncate">-</p>
+            </div>
+        </div>
+
+        <!-- Area Code Loader -->
+        <div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
+            <h2 class="text-sm font-semibold text-gray-300 uppercase tracking-wider mb-3">Area Code Loader</h2>
+            <div class="flex gap-3">
+                <input id="npaInput" type="text" maxlength="3" placeholder="e.g. 212" class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm w-24 focus:outline-none focus:border-brand-500">
+                <button onclick="ingestNPA()" id="ingestBtn" class="px-4 py-2 bg-brand-600 hover:bg-brand-700 rounded-lg text-sm font-medium transition disabled:opacity-50">Ingest NANPA Data</button>
+                <span id="ingestStatus" class="text-xs text-gray-500 self-center"></span>
+            </div>
+            <p class="text-xs text-gray-600 mt-2">Downloads & streams NANPA CO codes + thousands-block reports, classifies wireless carriers (incl. legacy subsidiaries), populates probe queue.</p>
+        </div>
+
+        <!-- Sampler Controls -->
+        <div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
+            <h2 class="text-sm font-semibold text-gray-300 uppercase tracking-wider mb-3">Sampler Controls</h2>
+            <div class="flex gap-3 flex-wrap">
+                <button onclick="samplerControl('start')" class="px-4 py-2 bg-green-600 hover:bg-green-700 rounded-lg text-sm font-medium transition">▶ Start</button>
+                <button onclick="samplerControl('stop')" class="px-4 py-2 bg-red-600 hover:bg-red-700 rounded-lg text-sm font-medium transition">⏹ Stop</button>
+                <button onclick="exportCSV()" class="px-4 py-2 bg-gray-700 hover:bg-gray-600 rounded-lg text-sm font-medium transition">📥 Export CSV</button>
+            </div>
+        </div>
+
+        <!-- Tabs -->
+        <div class="flex gap-1 border-b border-gray-800">
+            <button onclick="switchTab('blocks')" id="tabBlocks" class="px-4 py-2 text-sm font-medium border-b-2 border-brand-500 text-brand-400 transition">Wireless Blocks</button>
+            <button onclick="switchTab('numbers')" id="tabNumbers" class="px-4 py-2 text-sm font-medium border-b-2 border-transparent text-gray-500 hover:text-gray-300 transition">Probed Numbers</button>
+            <button onclick="switchTab('devices')" id="tabDevices" class="px-4 py-2 text-sm font-medium border-b-2 border-transparent text-gray-500 hover:text-gray-300 transition">GOWA Devices</button>
+            <button onclick="switchTab('ocn')" id="tabOCN" class="px-4 py-2 text-sm font-medium border-b-2 border-transparent text-gray-500 hover:text-gray-300 transition">OCN Overrides</button>
+        </div>
+
+        <!-- Blocks Table -->
+        <div id="panelBlocks" class="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden">
+            <div class="overflow-x-auto">
+                <table class="w-full text-sm">
+                    <thead class="bg-gray-800/50 text-gray-400 text-xs uppercase">
+                        <tr>
+                            <th class="px-4 py-2 text-left">NPA-NXX-Block</th>
+                            <th class="px-4 py-2 text-left">OCN</th>
+                            <th class="px-4 py-2 text-left">Company</th>
+                            <th class="px-4 py-2 text-left">Source</th>
+                            <th class="px-4 py-2 text-center">Status</th>
+                            <th class="px-4 py-2 text-center">Sample</th>
+                            <th class="px-4 py-2 text-center">Checked</th>
+                            <th class="px-4 py-2 text-center">Found</th>
+                        </tr>
+                    </thead>
+                    <tbody id="blocksBody" class="divide-y divide-gray-800"></tbody>
+                </table>
+            </div>
+            <div id="blocksPagination" class="px-4 py-3 flex justify-between items-center border-t border-gray-800 text-xs text-gray-500"></div>
+        </div>
+
+        <!-- Numbers Table -->
+        <div id="panelNumbers" class="hidden bg-gray-900 border border-gray-800 rounded-xl overflow-hidden">
+            <div class="p-3 flex gap-3 border-b border-gray-800">
+                <select id="numFilter" onchange="loadNumbers()" class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-1.5 text-xs">
+                    <option value="">All Numbers</option>
+                    <option value="1">WhatsApp ✓</option>
+                    <option value="0">Not on WhatsApp</option>
+                </select>
+            </div>
+            <div class="overflow-x-auto">
+                <table class="w-full text-sm">
+                    <thead class="bg-gray-800/50 text-gray-400 text-xs uppercase">
+                        <tr>
+                            <th class="px-4 py-2 text-left">Phone</th>
+                            <th class="px-4 py-2 text-left">NPA-NXX</th>
+                            <th class="px-4 py-2 text-center">Block</th>
+                            <th class="px-4 py-2 text-center">WhatsApp</th>
+                            <th class="px-4 py-2 text-left">Device</th>
+                            <th class="px-4 py-2 text-left">Probed At</th>
+                        </tr>
+                    </thead>
+                    <tbody id="numbersBody" class="divide-y divide-gray-800"></tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- Devices Panel -->
+        <div id="panelDevices" class="hidden bg-gray-900 border border-gray-800 rounded-xl p-5">
+            <div class="flex gap-3 mb-4 flex-wrap">
+                <input id="newDeviceId" type="text" placeholder="Device ID (e.g. org_1)" class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm flex-1 min-w-[200px] focus:outline-none focus:border-brand-500">
+                <input id="newDevicePhone" type="text" placeholder="Phone (e.g. 12125551234)" class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm w-48 focus:outline-none focus:border-brand-500">
+                <input id="newDeviceProxy" type="text" placeholder="Proxy URL (optional)" class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm w-48 focus:outline-none focus:border-brand-500">
+                <button onclick="addDevice()" class="px-4 py-2 bg-brand-600 hover:bg-brand-700 rounded-lg text-sm font-medium transition">Add Device</button>
+            </div>
+            <div id="devicesList" class="space-y-2"></div>
+        </div>
+
+        <!-- OCN Overrides Panel -->
+        <div id="panelOCN" class="hidden bg-gray-900 border border-gray-800 rounded-xl p-5">
+            <div class="flex gap-3 mb-4">
+                <input id="newOCN" type="text" placeholder="OCN" class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm w-32 focus:outline-none focus:border-brand-500">
+                <input id="newOCNName" type="text" placeholder="Company Name" class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm flex-1 focus:outline-none focus:border-brand-500">
+                <select id="newOCNWireless" class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-1.5 text-xs">
+                    <option value="1">Wireless</option>
+                    <option value="0">Wireline</option>
+                </select>
+                <button onclick="addOCNOverride()" class="px-4 py-2 bg-brand-600 hover:bg-brand-700 rounded-lg text-sm font-medium transition">Add Override</button>
+            </div>
+            <div id="ocnList" class="space-y-2"></div>
+        </div>
+    </main>
+
+    <script>
+        let token = localStorage.getItem('miner_token') || '';
+        let csrfToken = '';
+        let currentTab = 'blocks';
+        let blocksPage = 0;
+        const BLOCKS_LIMIT = 100;
+
+        function authHeaders() {
+            const h = token ? { 'Authorization': 'Basic ' + btoa('admin:' + token) } : {};
+            if (csrfToken) h['X-CSRF-Token'] = csrfToken;
+            return h;
+        }
+
+        async function fetchCsrfToken() {
+            try {
+                const h = token ? { 'Authorization': 'Basic ' + btoa('admin:' + token) } : {};
+                const res = await fetch('/api/csrf-token', { headers: h });
+                if (res.ok) {
+                    const data = await res.json();
+                    csrfToken = data.csrf_token;
+                }
+            } catch(e) { console.error('CSRF fetch failed:', e); }
+        }
+
+        function login() {
+            document.getElementById('authModal').classList.remove('hidden');
+            document.getElementById('authError').classList.add('hidden');
+        }
+
+        async function doLogin() {
+            const pw = document.getElementById('passwordInput').value;
+            token = pw;
+            localStorage.setItem('miner_token', pw);
+            document.getElementById('authModal').classList.add('hidden');
+            document.getElementById('loginBtn').textContent = '✓ Authenticated';
+            document.getElementById('loginBtn').classList.remove('bg-brand-600', 'hover:bg-brand-700');
+            document.getElementById('loginBtn').classList.add('bg-green-700');
+            await fetchCsrfToken();
+            refreshAll();
+        }
+
+        async function api(path, opts = {}) {
+            const method = (opts.method || 'GET').toUpperCase();
+            if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(method) && !csrfToken) {
+                await fetchCsrfToken();
+            }
+            const headers = { ...authHeaders(), ...(opts.headers || {}) };
+            const res = await fetch(path, { ...opts, headers });
+            if (res.status === 401) {
+                document.getElementById('loginBtn').textContent = 'Login';
+                document.getElementById('loginBtn').classList.add('bg-brand-600', 'hover:bg-brand-700');
+                document.getElementById('loginBtn').classList.remove('bg-green-700');
+                token = '';
+                csrfToken = '';
+                localStorage.removeItem('miner_token');
+                login();
+                throw new Error('Unauthorized');
+            }
+            if (res.status === 403) {
+                await fetchCsrfToken();
+                headers['X-CSRF-Token'] = csrfToken;
+                const retry = await fetch(path, { ...opts, headers });
+                if (!retry.ok) {
+                    const txt = await retry.text();
+                    throw new Error(txt);
+                }
+                return retry.json();
+            }
+            if (!res.ok) {
+                const txt = await res.text();
+                throw new Error(txt);
+            }
+            return res.json();
+        }
+
+        async function refreshStats() {
+            try {
+                const data = await api('/api/stats');
+                document.getElementById('statBlocksTotal').textContent = data.db_blocks_total;
+                document.getElementById('statPending').textContent = data.db_blocks_pending;
+                document.getElementById('statSweeping').textContent = data.db_blocks_sweeping;
+                document.getElementById('statDormant').textContent = data.db_blocks_dormant;
+                document.getElementById('statComplete').textContent = data.db_blocks_complete;
+                document.getElementById('statWAFound').textContent = data.db_whatsapp_found;
+                document.getElementById('statChecked').textContent = data.numbers_checked;
+                document.getElementById('statSaved').textContent = data.queries_saved;
+                document.getElementById('statSkipped').textContent = data.blocks_skipped;
+                document.getElementById('statDevice').textContent = data.current_device || '-';
+            } catch(e) { console.error(e); }
+        }
+
+        async function loadBlocks() {
+            try {
+                const data = await api(`/api/blocks?limit=${BLOCKS_LIMIT}&offset=${blocksPage * BLOCKS_LIMIT}`);
+                const tbody = document.getElementById('blocksBody');
+                tbody.innerHTML = data.blocks.map(b => {
+                    const statusColors = {
+                        'PENDING': 'text-yellow-400 bg-yellow-400/10',
+                        'DORMANT_SKIPPED': 'text-gray-500 bg-gray-500/10',
+                        'ACTIVE_SWEEPING': 'text-blue-400 bg-blue-400/10',
+                        'COMPLETE': 'text-green-400 bg-green-400/10',
+                    };
+                    const sc = statusColors[b.status] || 'text-gray-400 bg-gray-400/10';
+                    return `<tr class="hover:bg-gray-800/30 transition">
+                        <td class="px-4 py-2 font-mono text-white">${b.npa}-${b.nxx}-${b.block}</td>
+                        <td class="px-4 py-2 text-gray-400">${b.ocn || '-'}</td>
+                        <td class="px-4 py-2 text-gray-500 text-xs max-w-[200px] truncate">${b.company_name || '-'}</td>
+                        <td class="px-4 py-2 text-gray-600 text-xs">${b.source || '-'}</td>
+                        <td class="px-4 py-2 text-center"><span class="px-2 py-0.5 rounded-full text-xs ${sc}">${b.status}</span></td>
+                        <td class="px-4 py-2 text-center text-gray-400">${b.sample_hits}/${b.sample_total}</td>
+                        <td class="px-4 py-2 text-center text-gray-400">${b.numbers_checked}</td>
+                        <td class="px-4 py-2 text-center ${b.numbers_found > 0 ? 'text-green-400 font-bold' : 'text-gray-500'}">${b.numbers_found}</td>
+                    </tr>`;
+                }).join('');
+                document.getElementById('blocksPagination').innerHTML = `
+                    <span>Page ${blocksPage + 1} · ${data.total} total blocks</span>
+                    <div class="flex gap-2">
+                        <button onclick="blocksPage=Math.max(0,blocksPage-1);loadBlocks()" class="px-3 py-1 bg-gray-800 rounded text-xs hover:bg-gray-700" ${blocksPage===0?'disabled':''}>← Prev</button>
+                        <button onclick="blocksPage++;loadBlocks()" class="px-3 py-1 bg-gray-800 rounded text-xs hover:bg-gray-700" ${(blocksPage+1)*BLOCKS_LIMIT >= data.total?'disabled':''}>Next →</button>
+                    </div>`;
+            } catch(e) { console.error(e); }
+        }
+
+        async function loadNumbers() {
+            try {
+                const filter = document.getElementById('numFilter').value;
+                const params = filter ? `?is_on_whatsapp=${filter}&limit=500` : '?limit=500';
+                const data = await api('/api/numbers' + params);
+                document.getElementById('numbersBody').innerHTML = data.numbers.map(n => `
+                    <tr class="hover:bg-gray-800/30 transition">
+                        <td class="px-4 py-2 font-mono text-white">${n.phone}</td>
+                        <td class="px-4 py-2 text-gray-400">${n.npa}-${n.nxx}</td>
+                        <td class="px-4 py-2 text-center text-gray-400">${n.block}</td>
+                        <td class="px-4 py-2 text-center">${n.is_on_whatsapp ? '<span class="text-green-400 font-bold">✓</span>' : '<span class="text-gray-600">✗</span>'}</td>
+                        <td class="px-4 py-2 text-gray-500 text-xs">${n.device_id || '-'}</td>
+                        <td class="px-4 py-2 text-gray-500 text-xs">${n.probed_at || '-'}</td>
+                    </tr>
+                `).join('');
+            } catch(e) { console.error(e); }
+        }
+
+        async function loadDevices() {
+            try {
+                const data = await api('/api/devices');
+                document.getElementById('devicesList').innerHTML = data.local.map(d => {
+                    const statusColors = {
+                        'NEW': 'text-yellow-400', 'WARMING': 'text-blue-400',
+                        'MATURE': 'text-green-400', 'COOLDOWN_463': 'text-red-400'
+                    };
+                    const sc = statusColors[d.status] || 'text-gray-400';
+                    const cap = {'NEW':150,'WARMING':500,'MATURE':1800}[d.status] || 150;
+                    return `<div class="flex items-center justify-between bg-gray-800/50 rounded-lg px-4 py-3">
+                        <div>
+                            <span class="text-white font-mono text-sm">${d.device_id}</span>
+                            ${d.phone_number ? `<span class="ml-2 text-xs text-brand-400">📱 ${d.phone_number}</span>` : ''}
+                            <span class="ml-2 px-2 py-0.5 rounded-full text-xs ${sc} bg-gray-700/50">${d.status}</span>
+                            ${d.proxy_url ? `<span class="ml-2 text-xs text-gray-500">🔗 ${d.proxy_url}</span>` : ''}
+                        </div>
+                        <div class="flex items-center gap-4 text-xs text-gray-500">
+                            <span>Day ${d.age_days} · ${d.daily_checks}/${cap} checks today</span>
+                            <button onclick="deleteDevice('${d.device_id}')" class="text-red-400 hover:text-red-300">Remove</button>
+                        </div>
+                    </div>`;
+                }).join('') || '<p class="text-gray-500 text-sm">No devices registered. Add one above (Device ID + Phone number required for chatter).</p>';
+            } catch(e) { console.error(e); }
+        }
+
+        async function loadOCNOverrides() {
+            try {
+                const data = await api('/api/ocn-overrides');
+                document.getElementById('ocnList').innerHTML = data.overrides.map(o => `
+                    <div class="flex items-center justify-between bg-gray-800/50 rounded-lg px-4 py-3">
+                        <div>
+                            <span class="text-white font-mono text-sm">${o.ocn}</span>
+                            <span class="ml-2 text-gray-400 text-xs">${o.company_name || ''}</span>
+                        </div>
+                        <span class="px-2 py-0.5 rounded-full text-xs ${o.is_wireless ? 'text-green-400 bg-green-400/10' : 'text-red-400 bg-red-400/10'}">${o.is_wireless ? 'Wireless' : 'Wireline'}</span>
+                    </div>
+                `).join('') || '<p class="text-gray-500 text-sm">No OCN overrides. Add one above.</p>';
+            } catch(e) { console.error(e); }
+        }
+
+        async function ingestNPA() {
+            const npa = document.getElementById('npaInput').value.trim();
+            if (!/^\d{3}$/.test(npa)) { alert('Enter a valid 3-digit area code'); return; }
+            const btn = document.getElementById('ingestBtn');
+            const status = document.getElementById('ingestStatus');
+            btn.disabled = true;
+            status.textContent = 'Downloading & parsing NANPA data (may take 30s)...';
+            try {
+                const data = await api('/api/ingest?npa=' + npa, { method: 'POST' });
+                status.textContent = `✓ Ingested ${data.wireless_blocks_inserted} wireless blocks (${data.thousands_wireless_blocks} from thousands-block, ${data.co_codes_wireless_nxx} NXX from CO codes)`;
+                status.className = 'text-xs text-green-400 self-center';
+                refreshAll();
+            } catch(e) {
+                status.textContent = 'Error: ' + e.message;
+                status.className = 'text-xs text-red-400 self-center';
+            }
+            btn.disabled = false;
+        }
+
+        async function samplerControl(action) {
+            try {
+                await api('/api/sampler/' + action, { method: 'POST' });
+                document.getElementById('samplerBadge').textContent = action === 'start' ? '● Running' : '● Idle';
+                document.getElementById('samplerBadge').className = action === 'start'
+                    ? 'px-2 py-1 text-xs rounded-full bg-green-900/50 text-green-400 pulse'
+                    : 'px-2 py-1 text-xs rounded-full bg-gray-800 text-gray-400';
+                refreshStats();
+            } catch(e) { alert(e.message); }
+        }
+
+        async function addDevice() {
+            const id = document.getElementById('newDeviceId').value.trim();
+            const phone = document.getElementById('newDevicePhone').value.trim();
+            const proxy = document.getElementById('newDeviceProxy').value.trim();
+            if (!id) { alert('Enter a device ID'); return; }
+            try {
+                let url = '/api/devices?device_id=' + encodeURIComponent(id);
+                if (phone) url += '&phone_number=' + encodeURIComponent(phone);
+                if (proxy) url += '&proxy_url=' + encodeURIComponent(proxy);
+                await api(url, { method: 'POST' });
+                document.getElementById('newDeviceId').value = '';
+                document.getElementById('newDevicePhone').value = '';
+                document.getElementById('newDeviceProxy').value = '';
+                loadDevices();
+            } catch(e) { alert(e.message); }
+        }
+
+        async function deleteDevice(id) {
+            if (!confirm('Remove device ' + id + '?')) return;
+            try {
+                await api('/api/devices/' + encodeURIComponent(id), { method: 'DELETE' });
+                loadDevices();
+            } catch(e) { alert(e.message); }
+        }
+
+        async function addOCNOverride() {
+            const ocn = document.getElementById('newOCN').value.trim();
+            const name = document.getElementById('newOCNName').value.trim();
+            const wireless = document.getElementById('newOCNWireless').value;
+            if (!ocn) { alert('Enter an OCN'); return; }
+            try {
+                await api(`/api/ocn-overrides?ocn=${encodeURIComponent(ocn)}&company_name=${encodeURIComponent(name)}&is_wireless=${wireless === '1'}`, { method: 'POST' });
+                document.getElementById('newOCN').value = '';
+                document.getElementById('newOCNName').value = '';
+                loadOCNOverrides();
+            } catch(e) { alert(e.message); }
+        }
+
+        function exportCSV() {
+            const npa = document.getElementById('npaInput').value.trim();
+            const url = '/api/export' + (npa ? '?npa=' + npa : '');
+            fetch(url, { headers: authHeaders() })
+                .then(r => r.blob())
+                .then(blob => {
+                    const u = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = u;
+                    a.download = 'whatsapp_numbers.csv';
+                    a.click();
+                    URL.revokeObjectURL(u);
+                });
+        }
+
+        function switchTab(tab) {
+            currentTab = tab;
+            ['Blocks','Numbers','Devices','OCN'].forEach(t => {
+                document.getElementById('panel' + t).classList.add('hidden');
+                const btn = document.getElementById('tab' + t);
+                btn.classList.remove('border-brand-500', 'text-brand-400');
+                btn.classList.add('border-transparent', 'text-gray-500');
+            });
+            document.getElementById('panel' + tab.charAt(0).toUpperCase() + tab.slice(1)).classList.remove('hidden');
+            const activeBtn = document.getElementById('tab' + tab.charAt(0).toUpperCase() + tab.slice(1));
+            activeBtn.classList.add('border-brand-500', 'text-brand-400');
+            activeBtn.classList.remove('border-transparent', 'text-gray-500');
+
+            if (tab === 'blocks') loadBlocks();
+            else if (tab === 'numbers') loadNumbers();
+            else if (tab === 'devices') loadDevices();
+            else if (tab === 'ocn') loadOCNOverrides();
+        }
+
+        function refreshAll() {
+            refreshStats();
+            if (currentTab === 'blocks') loadBlocks();
+            else if (currentTab === 'numbers') loadNumbers();
+            else if (currentTab === 'devices') loadDevices();
+            else if (currentTab === 'ocn') loadOCNOverrides();
+        }
+
+        if (token) {
+            document.getElementById('loginBtn').textContent = '✓ Authenticated';
+            document.getElementById('loginBtn').classList.remove('bg-brand-600', 'hover:bg-brand-700');
+            document.getElementById('loginBtn').classList.add('bg-green-700');
+            fetchCsrfToken();
+        }
+        refreshAll();
+        setInterval(refreshStats, 10000);
+    </script>
+</body>
+</html>
