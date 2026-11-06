@@ -191,8 +191,8 @@
         <!-- Devices Panel -->
         <div id="panelDevices" class="hidden bg-gray-900 border border-gray-800 rounded-xl p-5">
             <div class="flex gap-3 mb-4 flex-wrap">
-                <input id="newDeviceId" type="text" placeholder="Device ID (e.g. org_1)" class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm flex-1 min-w-[200px] focus:outline-none focus:border-brand-500">
-                <input id="newDevicePhone" type="text" placeholder="Phone (e.g. 12125551234)" class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm w-48 focus:outline-none focus:border-brand-500">
+                <input id="newDeviceId" type="text" placeholder="Device ID (e.g. spare_1)" class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm flex-1 min-w-[200px] focus:outline-none focus:border-brand-500">
+                <input id="newDevicePhone" type="text" placeholder="Phone (e.g. 17325551234)" class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm w-48 focus:outline-none focus:border-brand-500">
                 <input id="newDeviceProxy" type="text" placeholder="Proxy URL (optional)" class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm w-48 focus:outline-none focus:border-brand-500">
                 <button onclick="addDevice()" class="px-4 py-2 bg-brand-600 hover:bg-brand-700 rounded-lg text-sm font-medium transition">Add Device</button>
             </div>
@@ -302,6 +302,12 @@
                 document.getElementById('statSaved').textContent = data.queries_saved;
                 document.getElementById('statSkipped').textContent = data.blocks_skipped;
                 document.getElementById('statDevice').textContent = data.current_device || '-';
+                if (typeof data.sampler_running === 'boolean') {
+                    document.getElementById('samplerBadge').textContent = data.sampler_running ? '● Running' : '● Idle';
+                    document.getElementById('samplerBadge').className = data.sampler_running
+                        ? 'px-2 py-1 text-xs rounded-full bg-green-900/50 text-green-400 pulse'
+                        : 'px-2 py-1 text-xs rounded-full bg-gray-800 text-gray-400';
+                }
             } catch(e) { console.error(e); }
         }
 
@@ -366,45 +372,63 @@
             document.getElementById('pairModal').classList.remove('hidden');
         }
 
+        async function submitPairCodeModal(deviceId) {
+            const input = document.getElementById('modalPairPhoneInput');
+            const phone = input ? input.value.trim() : '';
+            if (!phone) return;
+            await pairCodeLogin(deviceId, phone);
+            loadDevices();
+        }
+
         async function pairCodeLogin(deviceId, phoneNumber) {
             if (!phoneNumber) {
-                alert('This device has no phone number set. Add a phone number first.');
+                showPairModal(
+                    `Pair Code: ${deviceId}`,
+                    `<div class="bg-gray-800 rounded-lg p-4 space-y-3">
+                        <p class="text-xs text-gray-300">Enter the spare WhatsApp phone number (with country code, e.g. 17325551234):</p>
+                        <input id="modalPairPhoneInput" type="text" placeholder="e.g. 17325551234" class="w-full bg-gray-900 border border-gray-700 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-brand-500">
+                        <button onclick="submitPairCodeModal('${deviceId}')" class="w-full py-2 bg-brand-600 hover:bg-brand-700 rounded-lg text-sm font-medium transition">Get 8-Character Pair Code</button>
+                    </div>`
+                );
                 return;
             }
             try {
+                showPairModal(`Pair Code: ${deviceId}`, `<p class="text-xs text-gray-400">Requesting pairing code from GOWA...</p>`);
                 const data = await api(
                     `/api/devices/${encodeURIComponent(deviceId)}/login-code?phone=${encodeURIComponent(phoneNumber)}`,
                     { method: 'POST' }
                 );
-                const code = data?.results?.code || data?.code || JSON.stringify(data, null, 2);
+                const code = data?.results?.pair_code || data?.results?.code || data?.pair_code || data?.code || JSON.stringify(data, null, 2);
                 showPairModal(
                     `Pair Code: ${deviceId}`,
                     `<div class="bg-gray-800 rounded-lg p-4 text-center">
-                        <p class="text-xs text-gray-400 mb-2">Enter this code in WhatsApp on the target phone:</p>
+                        <p class="text-xs text-gray-400 mb-2">Enter this code in WhatsApp on the spare phone:</p>
                         <p class="text-3xl font-bold text-brand-400 tracking-widest font-mono">${code}</p>
                         <p class="text-xs text-gray-500 mt-2">Phone: ${phoneNumber}</p>
                     </div>`
                 );
             } catch(e) {
-                showPairModal('Error', `<p class="text-red-400">${e.message}</p>`);
+                showPairModal('Error', `<p class="text-red-400 text-xs">${e.message}</p>`);
             }
         }
 
         async function qrLogin(deviceId) {
             try {
+                showPairModal(`QR Login: ${deviceId}`, `<p class="text-xs text-gray-400">Generating QR code from GOWA...</p>`);
                 const data = await api(
                     `/api/devices/${encodeURIComponent(deviceId)}/login-qr`,
                     { method: 'POST' }
                 );
-                // GOWA may return a QR image (base64) or a URL
                 const qrData = data?.results?.qr || data?.qr || data?.results?.image || data?.image;
+                const duration = data?.results?.qr_duration || 30;
                 if (qrData) {
                     const imgSrc = qrData.startsWith('data:') ? qrData : `data:image/png;base64,${qrData}`;
                     showPairModal(
                         `QR Login: ${deviceId}`,
-                        `<div class="text-center">
-                            <img src="${imgSrc}" alt="QR Code" class="mx-auto max-w-[256px] rounded-lg border border-gray-700">
-                            <p class="text-xs text-gray-500 mt-2">Scan with WhatsApp on the target phone</p>
+                        `<div class="text-center space-y-2">
+                            <img src="${imgSrc}" alt="QR Code" class="mx-auto max-w-[256px] bg-white p-2 rounded-lg border border-gray-700">
+                            <p class="text-xs text-gray-400">Scan with WhatsApp (Linked Devices) on the spare phone (valid ~${duration}s)</p>
+                            <button onclick="qrLogin('${deviceId}')" class="px-3 py-1 bg-gray-800 hover:bg-gray-700 rounded text-xs text-brand-400">↻ Refresh QR</button>
                         </div>`
                     );
                 } else {
@@ -417,7 +441,7 @@
                     );
                 }
             } catch(e) {
-                showPairModal('Error', `<p class="text-red-400">${e.message}</p>`);
+                showPairModal('Error', `<p class="text-red-400 text-xs">${e.message}</p>`);
             }
         }
 
@@ -438,6 +462,11 @@
         async function loadDevices() {
             try {
                 const data = await api('/api/devices');
+                const gowaMap = {};
+                (data.gowa || []).forEach(g => {
+                    const gid = g.id || g.device_id;
+                    if (gid) gowaMap[gid] = g;
+                });
                 document.getElementById('devicesList').innerHTML = data.local.map(d => {
                     const statusColors = {
                         'NEW': 'text-yellow-400', 'WARMING': 'text-blue-400',
@@ -445,11 +474,15 @@
                     };
                     const sc = statusColors[d.status] || 'text-gray-400';
                     const cap = {'NEW':150,'WARMING':500,'MATURE':1800}[d.status] || 150;
+                    const gowaInfo = gowaMap[d.device_id];
+                    const gowaState = gowaInfo ? (gowaInfo.state || (gowaInfo.jid ? 'logged_in' : 'registered')) : 'unregistered';
+                    const gowaColor = gowaState === 'logged_in' || gowaState === 'connected' ? 'text-green-400' : 'text-gray-400';
                     return `<div class="flex items-center justify-between bg-gray-800/50 rounded-lg px-4 py-3 flex-wrap gap-2">
                         <div class="flex items-center gap-2 flex-wrap">
                             <span class="text-white font-mono text-sm">${d.device_id}</span>
                             ${d.phone_number ? `<span class="text-xs text-brand-400">📱 ${d.phone_number}</span>` : ''}
                             <span class="px-2 py-0.5 rounded-full text-xs ${sc} bg-gray-700/50">${d.status}</span>
+                            <span class="px-2 py-0.5 rounded-full text-xs ${gowaColor} bg-gray-900/60">GOWA: ${gowaState}</span>
                             ${d.proxy_url ? `<span class="text-xs text-gray-500">🔗 ${d.proxy_url}</span>` : ''}
                         </div>
                         <div class="flex items-center gap-2 text-xs">

@@ -1,7 +1,7 @@
 #!/bin/sh
 set -e
 
-echo "=== WhatsApp Number Miner v3.1 ==="
+echo "=== WhatsApp Number Miner v3.3.3 ==="
 mkdir -p /app/data
 
 # Validate required env vars
@@ -45,7 +45,7 @@ echo "Starting GOWA v9.8.0 on 127.0.0.1:3000..."
 
 echo "Waiting for GOWA to become ready..."
 for i in $(seq 1 30); do
-    if curl -s -u "${GOWA_BASIC_AUTH}" -o /dev/null -w "%{http_code}" "http://127.0.0.1:3000/app/devices" 2>/dev/null | grep -q "200"; then
+    if curl -s -u "${GOWA_BASIC_AUTH}" -o /dev/null -w "%{http_code}" "http://127.0.0.1:3000/devices" 2>/dev/null | grep -q "200"; then
         echo "GOWA is ready."
         break
     fi

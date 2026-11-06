@@ -4,25 +4,26 @@ WhatsApp Number Miner - zero-cost US mobile WhatsApp number extractor.
 Streams NANPA public data, classifies wireless carriers, probes via self-hosted
 GOWA v9.8.0 with anti-ban pacing. Single-file FastAPI backend.
 
+FIXES APPLIED (v3.3.3):
+  1. GOWA v9.8.0 multi-device registry integration: POST /devices to register device
+     slots in GOWA DeviceManager before /devices/{id}/login, /devices/{id}/login/code,
+     and /devices/{id}/logout so DeviceMiddleware never returns 404 DEVICE_NOT_FOUND.
+  2. Server-side QR image fetch & base64 data-URI encoding in GowaClient.login_qr()
+     so internal http://127.0.0.1:3000/statics/qrcode/*.png images render directly in
+     the browser pairing modal.
+  3. Normalize pair_code / code fields in GowaClient.login_code() and start sampler
+     in Idle state on container boot until explicitly started.
+
 FIXES APPLIED (v3.3.2):
   1. 8-minute self keep-alive background loop pinging /health so Render free tier
      does not spin down after 15 minutes of inactivity.
-  2. Startup auto-seed for NPA 732: loads seed_732.json if present (<1s), or
-     auto-ingests NPA 732 in a background thread on boot if wireless_blocks is empty,
-     and caches seed_732.json in DATA_DIR.
-  3. /api/backup/blocks (format=json|csv) and /api/backup/status endpoints for
-     exporting public NANPA wireless_blocks snapshots directly to Files/backups/.
-
-FIXES APPLIED (v3.3.1):
-  1. SQLite thread safety: ingest_nanpa_data_sync opens its own dedicated
-     connection instead of sharing _db_conn across threads; closes in finally.
-  2. Shared _db_conn writes wrapped in _db_lock throughout sampler + API routes.
-  3. GOWA QR & pair-code proxy endpoints: /api/devices/{id}/login-qr,
-     /api/devices/{id}/login-code, /api/devices/{id}/logout.
-  4. generate_csrf_token wrapped in _db_lock.
+  2. Startup auto-seed for NPA 732: loads seed_732.json / backups if present (<1s), or
+     auto-ingests NPA 732 in a background thread on boot if wireless_blocks is empty.
+  3. /api/backup/blocks (format=json|csv) and /api/backup/status endpoints.
 """
 
 import asyncio
+import base64
 import csv
 import io
 import json
@@ -38,6 +39,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlparse
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Depends, Query
@@ -348,34 +350,81 @@ class GowaClient:
             self._client = httpx.AsyncClient(
                 base_url=GOWA_URL,
                 auth=httpx.BasicAuth(self._user, self._pw),
-                timeout=httpx.Timeout(15.0),
+                timeout=httpx.Timeout(20.0),
                 limits=httpx.Limits(max_keepalive_connections=5, max_connections=20),
             )
         return self._client
 
+    async def get_devices(self) -> list:
+        client = await self._get_client()
+        try:
+            resp = await client.get("/devices")
+            if resp.status_code == 404:
+                resp = await client.get("/app/devices")
+            resp.raise_for_status()
+            res = resp.json().get("results")
+            if isinstance(res, list):
+                return res
+            if isinstance(res, dict):
+                return res.get("devices", [])
+            return []
+        except Exception as e:
+            log.warning(f"Failed to list GOWA devices: {e}")
+            return []
+
+    async def ensure_device(self, device_id: str) -> dict:
+        """Ensure device_id is registered in GOWA v9 DeviceManager via POST /devices."""
+        client = await self._get_client()
+        try:
+            devices = await self.get_devices()
+            for d in devices:
+                if isinstance(d, dict) and (d.get("id") == device_id or d.get("device_id") == device_id):
+                    return d
+            resp = await client.post("/devices", json={"device_id": device_id})
+            if resp.status_code in (200, 201):
+                return resp.json().get("results") or {"id": device_id}
+            log.warning(f"GOWA POST /devices for {device_id} returned {resp.status_code}: {resp.text}")
+        except Exception as e:
+            log.warning(f"Failed to ensure GOWA device {device_id}: {e}")
+        return {"id": device_id}
+
+    async def delete_device(self, device_id: str) -> None:
+        client = await self._get_client()
+        try:
+            await client.delete(f"/devices/{device_id}")
+        except Exception as e:
+            log.warning(f"Failed to delete GOWA device {device_id}: {e}")
+
     async def check_user(self, phone: str, device_id: str) -> dict:
+        await self.ensure_device(device_id)
         client = await self._get_client()
         headers = {"X-Device-Id": device_id}
         try:
             resp = await client.get("/user/check", params={"phone": phone}, headers=headers)
             resp.raise_for_status()
             data = resp.json()
+            results = data.get("results", {})
+            if isinstance(results, list) and results:
+                is_wa = bool(results[0].get("is_on_whatsapp", False))
+            elif isinstance(results, dict):
+                is_wa = bool(results.get("is_on_whatsapp", False))
+            else:
+                is_wa = False
             return {
-                "is_on_whatsapp": data.get("results", {}).get("is_on_whatsapp", False),
+                "is_on_whatsapp": is_wa,
                 "error": None,
                 "status_code": resp.status_code,
             }
         except httpx.HTTPStatusError as e:
             status = e.response.status_code
-            if status in (429, 463):
-                return {"is_on_whatsapp": False, "error": f"HTTP_{status}", "status_code": status}
-            if status in (401, 403):
+            if status in (429, 463, 401, 403):
                 return {"is_on_whatsapp": False, "error": f"HTTP_{status}", "status_code": status}
             raise
         except Exception as e:
             return {"is_on_whatsapp": False, "error": str(e), "status_code": 0}
 
     async def send_message(self, phone: str, message: str, device_id: str) -> dict:
+        await self.ensure_device(device_id)
         client = await self._get_client()
         headers = {"X-Device-Id": device_id, "Content-Type": "application/json"}
         try:
@@ -390,37 +439,70 @@ class GowaClient:
             log.warning(f"Chatter send failed: {e}")
             return {"error": str(e)}
 
-    async def get_devices(self) -> list:
-        client = await self._get_client()
-        try:
-            resp = await client.get("/app/devices")
-            resp.raise_for_status()
-            return resp.json().get("results", {}).get("devices", [])
-        except Exception as e:
-            log.warning(f"Failed to list GOWA devices: {e}")
-            return []
-
     async def login_qr(self, device_id: str) -> dict:
-        """GET /app/login with X-Device-Id header, returns QR code data."""
+        """Start QR pairing for device_id and inline the generated QR PNG as base64 data URI."""
+        await self.ensure_device(device_id)
         client = await self._get_client()
-        headers = {"X-Device-Id": device_id}
-        resp = await client.get("/app/login", headers=headers)
+        resp = await client.get(f"/devices/{device_id}/login")
+        if resp.status_code == 404:
+            resp = await client.get("/app/login", headers={"X-Device-Id": device_id})
         resp.raise_for_status()
-        return resp.json()
+        data = resp.json()
+        results = data.get("results") if isinstance(data.get("results"), dict) else {}
+        qr_link = results.get("qr_link") or data.get("qr_link")
+        if qr_link and not results.get("qr"):
+            try:
+                parsed = urlparse(qr_link)
+                qr_path = parsed.path or qr_link
+                img_resp = await client.get(qr_path)
+                if img_resp.status_code == 200 and img_resp.content:
+                    b64 = base64.b64encode(img_resp.content).decode("ascii")
+                    data_uri = f"data:image/png;base64,{b64}"
+                    results["qr"] = data_uri
+                    data["results"] = results
+                    data["qr"] = data_uri
+            except Exception as e:
+                log.warning(f"Failed to fetch QR image from {qr_link}: {e}")
+        return data
 
     async def login_code(self, phone: str, device_id: str) -> dict:
-        """GET /app/login-with-code with phone param and X-Device-Id header."""
+        """Start pairing-code login for device_id and normalize pair_code / code fields."""
+        await self.ensure_device(device_id)
+        clean_phone = re.sub(r"\D", "", phone or "")
         client = await self._get_client()
-        headers = {"X-Device-Id": device_id}
-        resp = await client.get("/app/login-with-code", params={"phone": phone}, headers=headers)
+        resp = await client.post(
+            f"/devices/{device_id}/login/code",
+            params={"phone": clean_phone},
+        )
+        if resp.status_code in (404, 405):
+            resp = await client.get(
+                "/app/login-with-code",
+                params={"phone": clean_phone},
+                headers={"X-Device-Id": device_id},
+            )
         resp.raise_for_status()
-        return resp.json()
+        data = resp.json()
+        results = data.get("results") if isinstance(data.get("results"), dict) else {}
+        code = (
+            results.get("pair_code")
+            or results.get("code")
+            or data.get("pair_code")
+            or data.get("code")
+        )
+        if code:
+            results["pair_code"] = code
+            results["code"] = code
+            data["results"] = results
+            data["code"] = code
+        return data
 
     async def logout_device(self, device_id: str) -> dict:
-        """GET /app/logout with X-Device-Id header."""
+        """Logout device_id on GOWA while keeping the device slot."""
+        await self.ensure_device(device_id)
         client = await self._get_client()
-        headers = {"X-Device-Id": device_id}
-        resp = await client.get("/app/logout", headers=headers)
+        resp = await client.post(f"/devices/{device_id}/logout")
+        if resp.status_code in (404, 405):
+            resp = await client.get("/app/logout", headers={"X-Device-Id": device_id})
         resp.raise_for_status()
         return resp.json()
 
@@ -603,7 +685,6 @@ def ingest_nanpa_data_sync(npa_target: str, db: sqlite3.Connection = None) -> di
 
         conn.commit()
 
-        # Save local seed cache in DATA_DIR
         try:
             rows = [
                 dict(r) for r in conn.execute(
@@ -1020,13 +1101,17 @@ async def _keep_alive_loop():
 
 
 async def _startup_auto_seed():
-    """Ensure TARGET_NPA (default 732) blocks are present on startup."""
+    """Ensure TARGET_NPA (default 732) blocks are present on startup and sync local devices to GOWA."""
     try:
         npa = TARGET_NPA or "732"
         seeded = seed_from_json_if_empty(npa)
         if seeded == 0:
             log.info(f"No blocks found for NPA {npa} on startup — auto-ingesting from NANPA...")
             await asyncio.to_thread(ingest_nanpa_data_sync, npa)
+        db = get_db()
+        rows = db.execute("SELECT device_id FROM gowa_devices").fetchall()
+        for r in rows:
+            await gowa.ensure_device(r["device_id"])
     except Exception as e:
         log.error(f"Startup auto-seed failed: {e}", exc_info=True)
 
@@ -1051,14 +1136,13 @@ async def lifespan(app: FastAPI):
     init_db()
     seed_task = asyncio.create_task(_startup_auto_seed())
     ka_task = asyncio.create_task(_keep_alive_loop())
-    await sampler.start()
     yield
     ka_task.cancel()
     seed_task.cancel()
     await sampler.stop()
     await gowa.close()
 
-app = FastAPI(title="WhatsApp Number Miner", version="3.3.2", lifespan=lifespan)
+app = FastAPI(title="WhatsApp Number Miner", version="3.3.3", lifespan=lifespan)
 
 # ── Routes ──────────────────────────────────────────────────────────────────
 
@@ -1069,7 +1153,7 @@ async def health():
         count = db.execute("SELECT COUNT(*) as c FROM wireless_blocks").fetchone()["c"]
         return {
             "status": "ok",
-            "version": "3.3.2",
+            "version": "3.3.3",
             "blocks_loaded": count,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
@@ -1104,7 +1188,7 @@ async def backup_status(npa: str = Query("732")):
     }
     return {
         "status": "ok",
-        "version": "3.3.2",
+        "version": "3.3.3",
         "npa": npa,
         "total_wireless_blocks": total,
         "by_source": by_source,
@@ -1148,7 +1232,7 @@ async def backup_blocks(
         )
     return {
         "npa": npa,
-        "version": "3.3.2",
+        "version": "3.3.3",
         "total": len(rows),
         "exported_at": datetime.now(timezone.utc).isoformat(),
         "blocks": rows,
@@ -1179,6 +1263,7 @@ async def get_stats(username: str = Depends(verify_credentials)):
     ).fetchall()
     return {
         **sampler.stats,
+        "sampler_running": sampler.running,
         "db_blocks_total": total_blocks, "db_blocks_pending": pending,
         "db_blocks_dormant": dormant, "db_blocks_sweeping": sweeping,
         "db_blocks_complete": complete, "db_whatsapp_found": wa_found,
@@ -1286,13 +1371,27 @@ async def add_device(
     db = get_db()
     try:
         with _db_lock:
-            db.execute(
-                "INSERT OR REPLACE INTO gowa_devices "
-                "(device_id, phone_number, proxy_url, status) VALUES (?, ?, ?, 'NEW')",
-                (device_id, phone_number, proxy_url),
-            )
+            existing = db.execute(
+                "SELECT phone_number, proxy_url, status, age_days, daily_checks, daily_check_date "
+                "FROM gowa_devices WHERE device_id = ?",
+                (device_id,),
+            ).fetchone()
+            if existing:
+                new_phone = phone_number if phone_number is not None else existing["phone_number"]
+                new_proxy = proxy_url if proxy_url is not None else existing["proxy_url"]
+                db.execute(
+                    "UPDATE gowa_devices SET phone_number = ?, proxy_url = ? WHERE device_id = ?",
+                    (new_phone, new_proxy, device_id),
+                )
+            else:
+                db.execute(
+                    "INSERT INTO gowa_devices (device_id, phone_number, proxy_url, status) "
+                    "VALUES (?, ?, ?, 'NEW')",
+                    (device_id, phone_number, proxy_url),
+                )
             db.commit()
-        return {"status": "ok", "device_id": device_id}
+        gowa_info = await gowa.ensure_device(device_id)
+        return {"status": "ok", "device_id": device_id, "gowa": gowa_info}
     except Exception as e:
         raise HTTPException(400, str(e))
 
@@ -1302,6 +1401,7 @@ async def remove_device(device_id: str, username: str = Depends(verify_csrf)):
     with _db_lock:
         db.execute("DELETE FROM gowa_devices WHERE device_id = ?", (device_id,))
         db.commit()
+    await gowa.delete_device(device_id)
     return {"status": "ok"}
 
 # ── GOWA QR & Pair-Code Proxy Endpoints ─────────────────────────────────────
@@ -1322,7 +1422,16 @@ async def device_login_code(
     username: str = Depends(verify_csrf),
 ):
     try:
-        result = await gowa.login_code(phone, device_id)
+        clean_phone = re.sub(r"\D", "", phone or "")
+        if clean_phone:
+            db = get_db()
+            with _db_lock:
+                db.execute(
+                    "UPDATE gowa_devices SET phone_number = ? WHERE device_id = ?",
+                    (clean_phone, device_id),
+                )
+                db.commit()
+        result = await gowa.login_code(clean_phone, device_id)
         return result
     except Exception as e:
         log.error(f"GOWA login_code failed for {device_id}: {e}")
