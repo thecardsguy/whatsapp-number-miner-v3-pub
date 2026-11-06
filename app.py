@@ -4,7 +4,7 @@ WhatsApp Number Miner - zero-cost US mobile WhatsApp number extractor.
 Streams NANPA public data, classifies wireless carriers, probes via self-hosted
 GOWA v9.8.0 with anti-ban pacing. Single-file FastAPI backend.
 
-FIXES APPLIED (v3.4.1):
+FIXES APPLIED (v3.4.2):
   1. Startup probe auto-seed (seed_probes_if_empty) from backups/npa_732_probes_seed.json:
      loads verified Phase A sample burst probes into number_probes, registers spare_1
      (19292718201) in gowa_devices and GOWA v9.8.0 DeviceManager, updates wireless_blocks
@@ -48,7 +48,7 @@ from fastapi import FastAPI, HTTPException, Request, Depends, Query
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
-# ── Config ──────────────────────────────────────────────────────────────────
+# ── Config ──────────────────���───────────────────────────────────────────────
 APP_KEY = os.getenv("APP_PASSWORD", "")
 GOWA_URL = os.getenv("GOWA_URL", "http://127.0.0.1:3000")
 GOWA_CREDS = os.getenv("GOWA_BASIC_AUTH", "")
@@ -1307,7 +1307,7 @@ def _load_html_template() -> str:
         _HTML_TEMPLATE = "<html><body><h1>WhatsApp Number Miner</h1><p>Template not found</p></body></html>"
     return _HTML_TEMPLATE
 
-# ── FastAPI App ─────────────────────────────────────────────────────────────
+# ── FastAPI App ─────��───────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
@@ -1319,7 +1319,7 @@ async def lifespan(app: FastAPI):
     await sampler.stop()
     await gowa.close()
 
-app = FastAPI(title="WhatsApp Number Miner", version="3.4.1", lifespan=lifespan)
+app = FastAPI(title="WhatsApp Number Miner", version="3.4.2", lifespan=lifespan)
 
 # ── Routes ──────────────────────────────────────────────────────────────────
 
@@ -1332,7 +1332,7 @@ async def health():
         wa_hits = db.execute("SELECT COUNT(*) as c FROM number_probes WHERE is_on_whatsapp=1").fetchone()["c"]
         return {
             "status": "ok",
-            "version": "3.4.1",
+            "version": "3.4.2",
             "blocks_loaded": count,
             "numbers_probed": probes,
             "whatsapp_found": wa_hits,
@@ -1382,7 +1382,7 @@ async def backup_status(npa: str = Query("732")):
     ).fetchone()["c"]
     return {
         "status": "ok",
-        "version": "3.4.1",
+        "version": "3.4.2",
         "npa": npa,
         "total_wireless_blocks": total,
         "by_source": by_source,
@@ -1426,7 +1426,7 @@ async def backup_probes(
     wa_hits = [r for r in rows if r["is_on_whatsapp"] == 1]
     return {
         "npa": npa,
-        "version": "3.4.1",
+        "version": "3.4.2",
         "total_probes": len(rows),
         "total_probed": len(rows),
         "whatsapp_found": len(wa_hits),
@@ -1479,7 +1479,7 @@ async def backup_blocks(
         )
     return {
         "npa": npa,
-        "version": "3.4.1",
+        "version": "3.4.2",
         "total": len(rows),
         "exported_at": datetime.now(timezone.utc).isoformat(),
         "blocks": rows,
