@@ -1,1 +1,16 @@
-{"status":"ok","version":"3.4.2","npa":"732","total_wireless_blocks":2281,"by_source":{"co_codes_backfill":810,"thousands_block":1471},"numbers_probed":120,"whatsapp_found":47,"blocks_sampled":["732-200-6","732-206-7","732-207-0","732-215-2","732-207-1","732-207-2"],"keep_alive_interval_s":480,"timestamp":"2026-11-06T06:00:00.000000+00:00"}
+{
+  "version": "3.4.2",
+  "total_wireless_blocks": 2281,
+  "numbers_probed": 140,
+  "whatsapp_found": 61,
+  "last_updated": "2026-11-06T20:15:00Z",
+  "blocks_sampled": [
+    {"block_prefix": "732-200-6", "carrier": "AT&T", "ocn": "4036", "probed": 20, "hits": 0, "status": "DORMANT_SKIPPED"},
+    {"block_prefix": "732-206-7", "carrier": "AT&T", "ocn": "4036", "probed": 20, "hits": 2, "status": "ACTIVE_SWEEPING"},
+    {"block_prefix": "732-207-0", "carrier": "T-Mobile", "ocn": "6623", "probed": 20, "hits": 9, "status": "ACTIVE_SWEEPING"},
+    {"block_prefix": "732-207-1", "carrier": "T-Mobile", "ocn": "6623", "probed": 20, "hits": 14, "status": "ACTIVE_SWEEPING"},
+    {"block_prefix": "732-207-2", "carrier": "T-Mobile", "ocn": "6623", "probed": 20, "hits": 14, "status": "ACTIVE_SWEEPING"},
+    {"block_prefix": "732-207-3", "carrier": "T-Mobile", "ocn": "6623", "probed": 20, "hits": 14, "status": "ACTIVE_SWEEPING"},
+    {"block_prefix": "732-215-2", "carrier": "Verizon Wireless", "ocn": "6391", "probed": 20, "hits": 8, "status": "ACTIVE_SWEEPING"}
+  ]
+}
