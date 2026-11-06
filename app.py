@@ -1466,7 +1466,8 @@ async def ingest_npa(
     npa: str = Query(..., description="Target area code, e.g. 212"),
     username: str = Depends(verify_csrf),
 ):
-    if not re.match(r"^\d{3}$", npa):\n        raise HTTPException(400, "NPA must be exactly 3 digits")
+    if not re.match(r"^\d{3}$", npa):
+        raise HTTPException(400, "NPA must be exactly 3 digits")
     try:
         result = await asyncio.to_thread(ingest_nanpa_data_sync, npa)
         return {"status": "ok", **result}
