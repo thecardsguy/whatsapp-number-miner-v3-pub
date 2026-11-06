@@ -1298,7 +1298,8 @@ async def backup_status(npa: str = Query("732")):
         r["source"]: r["c"]
         for r in db.execute(
             "SELECT source, COUNT(*) as c FROM wireless_blocks WHERE npa = ? GROUP BY source",
-            (npa,),\n        ).fetchall()
+            (npa,),
+        ).fetchall()
     }
     by_status = {
         r["status"]: r["c"]
@@ -1360,6 +1361,7 @@ async def backup_probes(
     return {
         "npa": npa,
         "version": "3.4.0",
+        "total_probes": len(rows),
         "total_probed": len(rows),
         "whatsapp_found": len(wa_hits),
         "whatsapp_numbers": [r["phone"] for r in wa_hits],
@@ -1449,8 +1451,12 @@ async def get_stats(username: str = Depends(verify_credentials)):
         "blocks_complete": complete,
         "queries_saved": dormant * (1000 - SAMPLE_SIZE),
         "sampler_running": sampler.running,
-        "db_blocks_total": total_blocks, "db_blocks_pending": pending,\n        "db_blocks_dormant": dormant, "db_blocks_sweeping": sweeping,
-        "db_blocks_complete": complete, "db_whatsapp_found": wa_found,
+        "db_blocks_total": total_blocks,
+        "db_blocks_pending": pending,
+        "db_blocks_dormant": dormant,
+        "db_blocks_sweeping": sweeping,
+        "db_blocks_complete": complete,
+        "db_whatsapp_found": wa_found,
         "db_total_probes": total_probes,
         "devices": [dict(d) for d in devices],
     }
@@ -1460,8 +1466,7 @@ async def ingest_npa(
     npa: str = Query(..., description="Target area code, e.g. 212"),
     username: str = Depends(verify_csrf),
 ):
-    if not re.match(r"^\d{3}$", npa):
-        raise HTTPException(400, "NPA must be exactly 3 digits")
+    if not re.match(r"^\d{3}$", npa):\n        raise HTTPException(400, "NPA must be exactly 3 digits")
     try:
         result = await asyncio.to_thread(ingest_nanpa_data_sync, npa)
         return {"status": "ok", **result}
