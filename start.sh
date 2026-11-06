@@ -1,7 +1,7 @@
 #!/bin/sh
 set -e
 
-echo "=== WhatsApp Number Miner v3.4.0 ==="
+echo "=== WhatsApp Number Miner v3.5.0 ==="
 mkdir -p /app/data
 
 # Validate required env vars

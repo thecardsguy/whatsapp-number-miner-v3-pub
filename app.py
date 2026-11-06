@@ -18,7 +18,8 @@ FIXES APPLIED (v3.4.2):
      httpx.HTTPStatusError statuses (not just 429/463/401/403). _probe_one_sample and
      _probe_one_sweep now return False immediately for non-rate-limit errors (HTTP_400,
      HTTP_500, connection errors) so failed checks NEVER insert is_on_whatsapp=0 rows.
-  5. apply_probes_to_db now persists merged probes to npa_<NPA>_probes_seed.json on disk.
+  5. apply_probes_to_db now persists merged probes to npa_<NPA>_probes_seed.json on disk
+     and accepts both 'phone' and 'phone_number' ('probed_at' and 'checked_at') keys.
   6. list_devices now shows "connected (spare_gateway)" for disconnected GOWA devices
      that have daily_checks > 0 in the local DB.
 
@@ -296,7 +297,8 @@ def apply_probes_to_db(probes: list, device_id: str = "spare_1", phone_number: s
 
     with _db_lock:
         for p in probes:
-            phone = re.sub(r"\D", "", str(p.get("phone", "")))
+            raw_phone = p.get("phone") or p.get("phone_number") or ""
+            phone = re.sub(r"\D", "", str(raw_phone))
             if not phone:
                 continue
             if len(phone) == 10:
@@ -306,7 +308,7 @@ def apply_probes_to_db(probes: list, device_id: str = "spare_1", phone_number: s
             blk = str(p.get("block") if p.get("block") is not None else phone[7:8])
             is_wa = int(bool(p.get("is_on_whatsapp", 0)))
             dev_id = p.get("device_id") or device_id
-            probed_at = p.get("probed_at") or datetime.now(timezone.utc).isoformat()
+            probed_at = p.get("probed_at") or p.get("checked_at") or datetime.now(timezone.utc).isoformat()
             db.execute(
                 "INSERT OR REPLACE INTO number_probes "
                 "(phone, npa, nxx, block, is_on_whatsapp, device_id, probed_at) "
@@ -395,9 +397,9 @@ def apply_probes_to_db(probes: list, device_id: str = "spare_1", phone_number: s
         seed_path.write_text(
             json.dumps({
                 "npa": TARGET_NPA,
-                "blocks_sampled": list(set(
+                "blocks_sampled": sorted(list(set(
                     f"{r['npa']}-{r['nxx']}-{r['block']}" for r in all_probes
-                )),
+                ))),
                 "device_id": device_id,
                 "phone_number": phone_number,
                 "sample_size": len(all_probes),
@@ -463,6 +465,9 @@ security = HTTPBasic(auto_error=False)
 def verify_credentials(credentials: HTTPBasicCredentials = Depends(security)):
     if not credentials:
         raise HTTPException(status_code=401, detail="Authentication required")
+    user = (credentials.username or "").lower().strip()
+    if user and user not in ("admin", ALLOWED_EMAIL):
+        raise HTTPException(status_code=403, detail=f"Access restricted to {ALLOWED_EMAIL}")
     if not secrets.compare_digest(credentials.password, APP_KEY):
         raise HTTPException(status_code=401, detail="Invalid credentials")
     return credentials.username
