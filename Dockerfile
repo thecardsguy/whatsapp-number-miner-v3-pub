@@ -20,6 +20,7 @@ RUN mkdir -p /app/data /app/storages /app/backups
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+ENV MINER_BUILD=v3.4.1
 COPY app.py .
 COPY templates/ templates/
 COPY backups/ backups/

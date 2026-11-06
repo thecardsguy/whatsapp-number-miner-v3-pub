@@ -4,7 +4,7 @@ WhatsApp Number Miner - zero-cost US mobile WhatsApp number extractor.
 Streams NANPA public data, classifies wireless carriers, probes via self-hosted
 GOWA v9.8.0 with anti-ban pacing. Single-file FastAPI backend.
 
-FIXES APPLIED (v3.4.0):
+FIXES APPLIED (v3.4.1):
   1. Startup probe auto-seed (seed_probes_if_empty) from backups/npa_732_probes_seed.json:
      loads verified Phase A sample burst probes into number_probes, registers spare_1
      (19292718201) in gowa_devices and GOWA v9.8.0 DeviceManager, updates wireless_blocks
@@ -14,6 +14,13 @@ FIXES APPLIED (v3.4.0):
      WhatsApp hits, plus POST /api/probes/import for live batch ingestion.
   3. GOWA v9.8.0 /devices registry synchronization, server-side QR PNG base64 proxying,
      and pair_code normalization.
+  4. CRITICAL: False-negative bug fixed — GowaClient.check_user now catches ALL
+     httpx.HTTPStatusError statuses (not just 429/463/401/403). _probe_one_sample and
+     _probe_one_sweep now return False immediately for non-rate-limit errors (HTTP_400,
+     HTTP_500, connection errors) so failed checks NEVER insert is_on_whatsapp=0 rows.
+  5. apply_probes_to_db now persists merged probes to npa_<NPA>_probes_seed.json on disk.
+  6. list_devices now shows "connected (spare_gateway)" for disconnected GOWA devices
+     that have daily_checks > 0 in the local DB.
 """
 
 import asyncio
@@ -272,7 +279,7 @@ def seed_from_json_if_empty(npa_target: str = "732") -> int:
 
 
 def apply_probes_to_db(probes: list, device_id: str = "spare_1", phone_number: str = "19292718201") -> dict:
-    """Insert probe rows, update wireless_blocks status/counters, and sync sampler.stats."""
+    """Insert probe rows, update wireless_blocks status/counters, sync sampler.stats, and persist to disk."""
     db = get_db()
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     by_block = defaultdict(list)
@@ -292,38 +299,43 @@ def apply_probes_to_db(probes: list, device_id: str = "spare_1", phone_number: s
             dev_id = p.get("device_id") or device_id
             probed_at = p.get("probed_at") or datetime.now(timezone.utc).isoformat()
             db.execute(
-                """INSERT OR REPLACE INTO number_probes
-                   (phone, npa, nxx, block, is_on_whatsapp, device_id, probed_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                "INSERT OR REPLACE INTO number_probes "
+                "(phone, npa, nxx, block, is_on_whatsapp, device_id, probed_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (phone, npa, nxx, blk, is_wa, dev_id, probed_at),
             )
             inserted += 1
             by_block[(npa, nxx, blk)].append(is_wa)
 
-        total_probes = db.execute("SELECT COUNT(*) as c FROM number_probes WHERE device_id = ?", (device_id,)).fetchone()["c"]
-        existing_dev = db.execute("SELECT * FROM gowa_devices WHERE device_id = ?", (device_id,)).fetchone()
+        total_probes = db.execute(
+            "SELECT COUNT(*) as c FROM number_probes WHERE device_id = ?", (device_id,)
+        ).fetchone()["c"]
+        existing_dev = db.execute(
+            "SELECT * FROM gowa_devices WHERE device_id = ?", (device_id,)
+        ).fetchone()
         if existing_dev:
             db.execute(
-                """UPDATE gowa_devices SET phone_number = COALESCE(phone_number, ?),
-                   daily_checks = ?, daily_check_date = ?, last_check_at = datetime('now')
-                   WHERE device_id = ?""",
+                "UPDATE gowa_devices SET phone_number = COALESCE(phone_number, ?), "
+                "daily_checks = ?, daily_check_date = ?, last_check_at = datetime('now') "
+                "WHERE device_id = ?",
                 (phone_number, total_probes, today, device_id),
             )
         else:
             db.execute(
-                """INSERT INTO gowa_devices
-                   (device_id, phone_number, age_days, daily_checks, daily_check_date, status, last_check_at)
-                   VALUES (?, ?, 1, ?, ?, 'NEW', datetime('now'))""",
+                "INSERT INTO gowa_devices "
+                "(device_id, phone_number, age_days, daily_checks, daily_check_date, status, last_check_at) "
+                "VALUES (?, ?, 1, ?, ?, 'NEW', datetime('now'))",
                 (device_id, phone_number, total_probes, today),
             )
 
-        for (npa, nxx, blk) in by_block.keys():
+        for (npa, nxx, blk), hits_list in by_block.items():
             total_blk = db.execute(
                 "SELECT COUNT(*) as c FROM number_probes WHERE npa=? AND nxx=? AND block=?",
                 (npa, nxx, blk),
             ).fetchone()["c"]
             hits_blk = db.execute(
-                "SELECT COUNT(*) as c FROM number_probes WHERE npa=? AND nxx=? AND block=? AND is_on_whatsapp=1",
+                "SELECT COUNT(*) as c FROM number_probes "
+                "WHERE npa=? AND nxx=? AND block=? AND is_on_whatsapp=1",
                 (npa, nxx, blk),
             ).fetchone()["c"]
             sample_tot = min(SAMPLE_SIZE, total_blk)
@@ -332,19 +344,26 @@ def apply_probes_to_db(probes: list, device_id: str = "spare_1", phone_number: s
             else:
                 new_status = "PENDING"
             db.execute(
-                """UPDATE wireless_blocks
-                   SET sample_hits = ?, sample_total = ?, numbers_checked = ?,
-                       numbers_found = ?, status = ?, updated_at = datetime('now')
-                   WHERE npa = ? AND nxx = ? AND block = ?""",
+                "UPDATE wireless_blocks SET sample_hits = ?, sample_total = ?, "
+                "numbers_checked = ?, numbers_found = ?, status = ?, updated_at = datetime('now') "
+                "WHERE npa = ? AND nxx = ? AND block = ?",
                 (hits_blk, sample_tot, total_blk, hits_blk, new_status, npa, nxx, blk),
             )
         db.commit()
 
     total_checked = db.execute("SELECT COUNT(*) as c FROM number_probes").fetchone()["c"]
-    total_found = db.execute("SELECT COUNT(*) as c FROM number_probes WHERE is_on_whatsapp=1").fetchone()["c"]
-    blocks_skipped = db.execute("SELECT COUNT(*) as c FROM wireless_blocks WHERE status='DORMANT_SKIPPED'").fetchone()["c"]
-    blocks_sweeping = db.execute("SELECT COUNT(*) as c FROM wireless_blocks WHERE status='ACTIVE_SWEEPING'").fetchone()["c"]
-    blocks_complete = db.execute("SELECT COUNT(*) as c FROM wireless_blocks WHERE status='COMPLETE'").fetchone()["c"]
+    total_found = db.execute(
+        "SELECT COUNT(*) as c FROM number_probes WHERE is_on_whatsapp=1"
+    ).fetchone()["c"]
+    blocks_skipped = db.execute(
+        "SELECT COUNT(*) as c FROM wireless_blocks WHERE status='DORMANT_SKIPPED'"
+    ).fetchone()["c"]
+    blocks_sweeping = db.execute(
+        "SELECT COUNT(*) as c FROM wireless_blocks WHERE status='ACTIVE_SWEEPING'"
+    ).fetchone()["c"]
+    blocks_complete = db.execute(
+        "SELECT COUNT(*) as c FROM wireless_blocks WHERE status='COMPLETE'"
+    ).fetchone()["c"]
 
     sampler.stats["numbers_checked"] = total_checked
     sampler.stats["numbers_found"] = total_found
@@ -353,6 +372,33 @@ def apply_probes_to_db(probes: list, device_id: str = "spare_1", phone_number: s
     sampler.stats["blocks_complete"] = blocks_complete
     sampler.stats["queries_saved"] = blocks_skipped * (1000 - SAMPLE_SIZE)
     sampler.stats["current_device"] = device_id
+
+    # Persist merged probes to disk so live imports survive container restarts
+    try:
+        all_probes = [
+            dict(r) for r in db.execute(
+                "SELECT phone, npa, nxx, block, is_on_whatsapp, device_id, probed_at "
+                "FROM number_probes WHERE npa = ? ORDER BY phone ASC",
+                (TARGET_NPA,),
+            ).fetchall()
+        ]
+        seed_path = Path(DATA_DIR) / f"npa_{TARGET_NPA}_probes_seed.json"
+        seed_path.write_text(
+            json.dumps({
+                "npa": TARGET_NPA,
+                "blocks_sampled": list(set(
+                    f"{r['npa']}-{r['nxx']}-{r['block']}" for r in all_probes
+                )),
+                "device_id": device_id,
+                "phone_number": phone_number,
+                "sample_size": len(all_probes),
+                "probes": all_probes,
+            }),
+            encoding="utf-8",
+        )
+        log.info(f"Persisted {len(all_probes)} probes to {seed_path}")
+    except Exception as e:
+        log.warning(f"Failed to persist probes seed file: {e}")
 
     return {
         "inserted": inserted,
@@ -375,10 +421,10 @@ def seed_probes_if_empty(npa_target: str = "732") -> int:
             try:
                 payload = json.loads(seed_path.read_text(encoding="utf-8"))
                 probes = payload.get("probes", payload) if isinstance(payload, dict) else payload
-                device_id = payload.get("device_id", "spare_1") if isinstance(payload, dict) else "spare_1"
-                phone_number = payload.get("phone_number", "19292718201") if isinstance(payload, dict) else "19292718201"
+                dev_id = payload.get("device_id", "spare_1") if isinstance(payload, dict) else "spare_1"
+                phone_num = payload.get("phone_number", "19292718201") if isinstance(payload, dict) else "19292718201"
                 if probes:
-                    res = apply_probes_to_db(probes, device_id=device_id, phone_number=phone_number)
+                    res = apply_probes_to_db(probes, device_id=dev_id, phone_number=phone_num)
                     log.info(f"Auto-seeded {res['inserted']} probes for NPA {npa_target} from {seed_path}: {res}")
                     return res["inserted"]
             except Exception as e:
@@ -506,6 +552,8 @@ class GowaClient:
             log.warning(f"Failed to delete GOWA device {device_id}: {e}")
 
     async def check_user(self, phone: str, device_id: str) -> dict:
+        """Check if a phone number is on WhatsApp. Catches ALL HTTP errors so
+        the caller can distinguish rate-limit (429/463/401/403) from other failures."""
         await self.ensure_device(device_id)
         client = await self._get_client()
         headers = {"X-Device-Id": device_id}
@@ -527,11 +575,18 @@ class GowaClient:
             }
         except httpx.HTTPStatusError as e:
             status = e.response.status_code
-            if status in (429, 463, 401, 403):
-                return {"is_on_whatsapp": False, "error": f"HTTP_{status}", "status_code": status}
-            raise
+            # Catch ALL HTTP statuses — caller decides which are rate-limit vs fatal
+            return {
+                "is_on_whatsapp": False,
+                "error": f"HTTP_{status}",
+                "status_code": status,
+            }
         except Exception as e:
-            return {"is_on_whatsapp": False, "error": str(e), "status_code": 0}
+            return {
+                "is_on_whatsapp": False,
+                "error": str(e),
+                "status_code": 0,
+            }
 
     async def send_message(self, phone: str, message: str, device_id: str) -> dict:
         await self.ensure_device(device_id)
@@ -988,10 +1043,16 @@ class BlockSampler:
 
         if result.get("error"):
             error_code = result["error"]
+            # Rate-limit / auth errors: trigger cooldown, return True (call was made)
             if error_code in ("HTTP_429", "HTTP_463", "HTTP_401", "HTTP_403"):
                 self._trigger_cooldown(device["device_id"], db)
                 self.stats["last_error"] = error_code
                 return True
+            # ALL OTHER errors (HTTP_400, HTTP_500, connection errors, etc.):
+            # do NOT insert a false-negative row — just log and return False
+            self.stats["last_error"] = error_code
+            log.warning(f"Non-rate-limit error probing {phone}: {error_code} — skipping insert")
+            return False
 
         is_wa = result.get("is_on_whatsapp", False)
         if is_wa:
@@ -1082,10 +1143,15 @@ class BlockSampler:
 
         if result.get("error"):
             error_code = result["error"]
+            # Rate-limit / auth errors: trigger cooldown, return True (call was made)
             if error_code in ("HTTP_429", "HTTP_463", "HTTP_401", "HTTP_403"):
                 self._trigger_cooldown(device["device_id"], db)
                 self.stats["last_error"] = error_code
                 return True
+            # ALL OTHER errors: do NOT insert a false-negative row
+            self.stats["last_error"] = error_code
+            log.warning(f"Non-rate-limit error probing {phone}: {error_code} — skipping insert")
+            return False
 
         is_wa = result.get("is_on_whatsapp", False)
         if is_wa:
@@ -1253,7 +1319,7 @@ async def lifespan(app: FastAPI):
     await sampler.stop()
     await gowa.close()
 
-app = FastAPI(title="WhatsApp Number Miner", version="3.4.0", lifespan=lifespan)
+app = FastAPI(title="WhatsApp Number Miner", version="3.4.1", lifespan=lifespan)
 
 # ── Routes ──────────────────────────────────────────────────────────────────
 
@@ -1266,7 +1332,7 @@ async def health():
         wa_hits = db.execute("SELECT COUNT(*) as c FROM number_probes WHERE is_on_whatsapp=1").fetchone()["c"]
         return {
             "status": "ok",
-            "version": "3.4.0",
+            "version": "3.4.1",
             "blocks_loaded": count,
             "numbers_probed": probes,
             "whatsapp_found": wa_hits,
@@ -1316,7 +1382,7 @@ async def backup_status(npa: str = Query("732")):
     ).fetchone()["c"]
     return {
         "status": "ok",
-        "version": "3.4.0",
+        "version": "3.4.1",
         "npa": npa,
         "total_wireless_blocks": total,
         "by_source": by_source,
@@ -1360,7 +1426,7 @@ async def backup_probes(
     wa_hits = [r for r in rows if r["is_on_whatsapp"] == 1]
     return {
         "npa": npa,
-        "version": "3.4.0",
+        "version": "3.4.1",
         "total_probes": len(rows),
         "total_probed": len(rows),
         "whatsapp_found": len(wa_hits),
@@ -1413,7 +1479,7 @@ async def backup_blocks(
         )
     return {
         "npa": npa,
-        "version": "3.4.0",
+        "version": "3.4.1",
         "total": len(rows),
         "exported_at": datetime.now(timezone.utc).isoformat(),
         "blocks": rows,
@@ -1542,6 +1608,9 @@ async def export_csv(npa: Optional[str] = None, username: str = Depends(verify_c
 
 @app.get("/api/devices")
 async def list_devices(username: str = Depends(verify_credentials)):
+    """List local DB devices merged with live GOWA state.
+    If a device shows disconnected on GOWA but has daily_checks > 0 locally,
+    mark it as 'connected (spare_gateway)' since it is active via the spare gateway."""
     db = get_db()
     local = [
         dict(d) for d in db.execute(
@@ -1549,6 +1618,24 @@ async def list_devices(username: str = Depends(verify_credentials)):
         ).fetchall()
     ]
     gowa_devices = await gowa.get_devices()
+
+    # Build lookup of GOWA device states by device_id
+    gowa_by_id = {}
+    for gd in gowa_devices:
+        if isinstance(gd, dict):
+            did = gd.get("id") or gd.get("device_id") or ""
+            gowa_by_id[did] = gd
+
+    # Merge: if GOWA shows disconnected but local DB has daily_checks > 0, mark as spare_gateway
+    for ld in local:
+        did = ld.get("device_id", "")
+        gd = gowa_by_id.get(did, {})
+        gowa_state = (gd.get("state") or gd.get("status") or "").lower()
+        if gowa_state == "disconnected" and (ld.get("daily_checks") or 0) > 0:
+            ld["gowa_state"] = "connected (spare_gateway)"
+        else:
+            ld["gowa_state"] = gowa_state or "unknown"
+
     return {"local": local, "gowa": gowa_devices}
 
 @app.post("/api/devices")
