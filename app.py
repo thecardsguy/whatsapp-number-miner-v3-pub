@@ -5,32 +5,15 @@ Streams NANPA public data, classifies wireless carriers, probes via self-hosted
 GOWA v9.8.0 with anti-ban pacing. Single-file FastAPI backend.
 
 FIXES APPLIED (v3.4.0):
-  1. Phase A 20-number sample burst on 732-200-6 (OCN 4036, NEW CINGULAR WIRELESS PCS, LLC - DC)
-     with auto-seed probes from backups/npa_732_probes_seed.json into gowa_devices,
-     number_probes, wireless_blocks, and sampler.stats on startup.
-  2. GET /api/backup/probes?npa=732&format=json|csv endpoint (no auth, matching /api/backup/status)
-     returning all number_probes rows for the given NPA plus summary counts.
-  3. seed_probes_if_empty(npa_target="732") called inside _startup_auto_seed() reads
-     DATA_DIR/npa_732_probes_seed.json, inserts device "spare_1" into gowa_devices,
-     inserts probe rows into number_probes, updates wireless_blocks for block 732-200-6,
-     and updates sampler.stats.
-
-FIXES APPLIED (v3.3.3):
-  1. GOWA v9.8.0 multi-device registry integration: POST /devices to register device
-     slots in GOWA DeviceManager before /devices/{id}/login, /devices/{id}/login/code,
-     and /devices/{id}/logout so DeviceMiddleware never returns 404 DEVICE_NOT_FOUND.
-  2. Server-side QR image fetch & base64 data-URI encoding in GowaClient.login_qr()
-     so internal http://127.0.0.1:3000/statics/qrcode/*.png images render directly in
-     the browser pairing modal.
-  3. Normalize pair_code / code fields in GowaClient.login_code() and start sampler
-     in Idle state on container boot until explicitly started.
-
-FIXES APPLIED (v3.3.2):
-  1. 8-minute self keep-alive background loop pinging /health so Render free tier
-     does not spin down after 15 minutes of inactivity.
-  2. Startup auto-seed for NPA 732: loads seed_732.json / backups if present (<1s), or
-     auto-ingests NPA 732 in a background thread on boot if wireless_blocks is empty.
-  3. /api/backup/blocks (format=json|csv) and /api/backup/status endpoints.
+  1. Startup probe auto-seed (seed_probes_if_empty) from backups/npa_732_probes_seed.json:
+     loads verified Phase A sample burst probes into number_probes, registers spare_1
+     (19292718201) in gowa_devices and GOWA v9.8.0 DeviceManager, updates wireless_blocks
+     (ACTIVE_SWEEPING / DORMANT_SKIPPED, sample_hits, sample_total, numbers_checked,
+     numbers_found), and initializes sampler.stats.
+  2. /api/backup/probes (format=json|csv) endpoint for exporting all probed numbers and
+     WhatsApp hits, plus POST /api/probes/import for live batch ingestion.
+  3. GOWA v9.8.0 /devices registry synchronization, server-side QR PNG base64 proxying,
+     and pair_code normalization.
 """
 
 import asyncio
@@ -46,6 +29,7 @@ import sqlite3
 import tempfile
 import threading
 import zipfile
+from collections import defaultdict
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -287,113 +271,121 @@ def seed_from_json_if_empty(npa_target: str = "732") -> int:
     return 0
 
 
-def seed_probes_if_empty(npa_target: str = "732") -> int:
-    """v3.4.0: Seed probe results from backups/npa_732_probes_seed.json on startup.
-
-    Reads the Phase A sample burst JSON, inserts device "spare_1" into gowa_devices,
-    inserts probe rows into number_probes, updates wireless_blocks for the sampled block,
-    and updates sampler.stats. Only runs if number_probes is empty for the NPA.
-    """
+def apply_probes_to_db(probes: list, device_id: str = "spare_1", phone_number: str = "19292718201") -> dict:
+    """Insert probe rows, update wireless_blocks status/counters, and sync sampler.stats."""
     db = get_db()
-    existing = db.execute(
-        "SELECT COUNT(*) as c FROM number_probes WHERE npa = ?", (npa_target,)
-    ).fetchone()["c"]
-    if existing > 0:
-        log.info(f"seed_probes_if_empty: {existing} probes already exist for NPA {npa_target}, skipping")
-        return existing
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    by_block = defaultdict(list)
+    inserted = 0
 
+    with _db_lock:
+        for p in probes:
+            phone = re.sub(r"\D", "", str(p.get("phone", "")))
+            if not phone:
+                continue
+            if len(phone) == 10:
+                phone = "1" + phone
+            npa = str(p.get("npa") or phone[1:4])
+            nxx = str(p.get("nxx") or phone[4:7])
+            blk = str(p.get("block") if p.get("block") is not None else phone[7:8])
+            is_wa = int(bool(p.get("is_on_whatsapp", 0)))
+            dev_id = p.get("device_id") or device_id
+            probed_at = p.get("probed_at") or datetime.now(timezone.utc).isoformat()
+            db.execute(
+                """INSERT OR REPLACE INTO number_probes
+                   (phone, npa, nxx, block, is_on_whatsapp, device_id, probed_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (phone, npa, nxx, blk, is_wa, dev_id, probed_at),
+            )
+            inserted += 1
+            by_block[(npa, nxx, blk)].append(is_wa)
+
+        # Ensure spare_1 is registered in gowa_devices with updated daily_checks
+        total_probes = db.execute("SELECT COUNT(*) as c FROM number_probes WHERE device_id = ?", (device_id,)).fetchone()["c"]
+        existing_dev = db.execute("SELECT * FROM gowa_devices WHERE device_id = ?", (device_id,)).fetchone()
+        if existing_dev:
+            db.execute(
+                """UPDATE gowa_devices SET phone_number = COALESCE(phone_number, ?),
+                   daily_checks = ?, daily_check_date = ?, last_check_at = datetime('now')
+                   WHERE device_id = ?""",
+                (phone_number, total_probes, today, device_id),
+            )
+        else:
+            db.execute(
+                """INSERT INTO gowa_devices
+                   (device_id, phone_number, age_days, daily_checks, daily_check_date, status, last_check_at)
+                   VALUES (?, ?, 1, ?, ?, 'NEW', datetime('now'))""",
+                (device_id, phone_number, total_probes, today),
+            )
+
+        # Recompute block stats for every touched block
+        for (npa, nxx, blk) in by_block.keys():
+            total_blk = db.execute(
+                "SELECT COUNT(*) as c FROM number_probes WHERE npa=? AND nxx=? AND block=?",
+                (npa, nxx, blk),
+            ).fetchone()["c"]
+            hits_blk = db.execute(
+                "SELECT COUNT(*) as c FROM number_probes WHERE npa=? AND nxx=? AND block=? AND is_on_whatsapp=1",
+                (npa, nxx, blk),
+            ).fetchone()["c"]
+            sample_tot = min(SAMPLE_SIZE, total_blk)
+            if total_blk >= SAMPLE_SIZE:
+                new_status = "ACTIVE_SWEEPING" if hits_blk > 0 else "DORMANT_SKIPPED"
+            else:
+                new_status = "PENDING"
+            db.execute(
+                """UPDATE wireless_blocks
+                   SET sample_hits = ?, sample_total = ?, numbers_checked = ?,
+                       numbers_found = ?, status = ?, updated_at = datetime('now')
+                   WHERE npa = ? AND nxx = ? AND block = ?""",
+                (hits_blk, sample_tot, total_blk, hits_blk, new_status, npa, nxx, blk),
+            )
+        db.commit()
+
+    # Sync in-memory sampler.stats from DB so dashboard cards reflect true totals
+    total_checked = db.execute("SELECT COUNT(*) as c FROM number_probes").fetchone()["c"]
+    total_found = db.execute("SELECT COUNT(*) as c FROM number_probes WHERE is_on_whatsapp=1").fetchone()["c"]
+    blocks_skipped = db.execute("SELECT COUNT(*) as c FROM wireless_blocks WHERE status='DORMANT_SKIPPED'").fetchone()["c"]
+    blocks_sweeping = db.execute("SELECT COUNT(*) as c FROM wireless_blocks WHERE status='ACTIVE_SWEEPING'").fetchone()["c"]
+    blocks_complete = db.execute("SELECT COUNT(*) as c FROM wireless_blocks WHERE status='COMPLETE'").fetchone()["c"]
+
+    sampler.stats["numbers_checked"] = total_checked
+    sampler.stats["numbers_found"] = total_found
+    sampler.stats["blocks_skipped"] = blocks_skipped
+    sampler.stats["blocks_sweeping"] = blocks_sweeping
+    sampler.stats["blocks_complete"] = blocks_complete
+    sampler.stats["queries_saved"] = blocks_skipped * (1000 - SAMPLE_SIZE)
+    sampler.stats["current_device"] = device_id
+
+    return {
+        "inserted": inserted,
+        "numbers_checked": total_checked,
+        "numbers_found": total_found,
+        "blocks_skipped": blocks_skipped,
+        "blocks_sweeping": blocks_sweeping,
+        "queries_saved": sampler.stats["queries_saved"],
+    }
+
+
+def seed_probes_if_empty(npa_target: str = "732") -> int:
+    """Load backups/npa_732_probes_seed.json on startup so probed numbers survive container restarts."""
     candidates = [
-        Path(__file__).parent / "backups" / f"npa_{npa_target}_probes_seed.json",
         Path(DATA_DIR) / f"npa_{npa_target}_probes_seed.json",
+        Path(__file__).parent / "backups" / f"npa_{npa_target}_probes_seed.json",
     ]
     for seed_path in candidates:
         if seed_path.exists():
             try:
                 payload = json.loads(seed_path.read_text(encoding="utf-8"))
-                probes = payload.get("probes", [])
-                if not probes:
-                    log.warning(f"seed_probes_if_empty: no probes in {seed_path}")
-                    continue
-
-                device_id = payload.get("device_id", "spare_1")
-                phone_number = payload.get("phone_number", "19292718201")
-                sample_size = payload.get("sample_size", len(probes))
-                block_sampled = payload.get("block_sampled", "")
-
-                inserted_probes = 0
-                hits = 0
-
-                with _db_lock:
-                    # Insert device "spare_1"
-                    db.execute(
-                        """INSERT OR IGNORE INTO gowa_devices
-                           (device_id, phone_number, status, daily_checks, daily_check_date)
-                           VALUES (?, ?, 'NEW', ?, date('now'))""",
-                        (device_id, phone_number, len(probes)),
-                    )
-
-                    # Insert probe rows
-                    for p in probes:
-                        phone = p.get("phone", "")
-                        npa = p.get("npa", npa_target)
-                        nxx = p.get("nxx", "")
-                        block = p.get("block", "")
-                        is_wa = int(p.get("is_on_whatsapp", 0))
-                        probed_at = p.get("probed_at", datetime.now(timezone.utc).isoformat())
-                        if is_wa:
-                            hits += 1
-                        db.execute(
-                            """INSERT OR IGNORE INTO number_probes
-                               (phone, npa, nxx, block, is_on_whatsapp, device_id, probed_at)
-                               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                            (phone, npa, nxx, block, is_wa, device_id, probed_at),
-                        )
-                        inserted_probes += 1
-
-                    # Update wireless_blocks for the sampled block
-                    if block_sampled and "-" in block_sampled:
-                        parts = block_sampled.split("-")
-                        if len(parts) == 3:
-                            b_npa, b_nxx, b_blk = parts[0], parts[1], parts[2]
-                            new_status = "ACTIVE_SWEEPING" if hits > 0 else "DORMANT_SKIPPED"
-                            db.execute(
-                                """INSERT OR IGNORE INTO wireless_blocks
-                                   (npa, nxx, block, ocn, company_name, source, status,
-                                    sample_hits, sample_total, numbers_checked, numbers_found)
-                                   VALUES (?, ?, ?, '4036', 'NEW CINGULAR WIRELESS PCS, LLC - DC',
-                                    'phase_a_burst', ?, ?, ?, ?, ?)""",
-                                (b_npa, b_nxx, b_blk, new_status, hits, sample_size, sample_size, hits),
-                            )
-                            # Also update if already exists
-                            db.execute(
-                                """UPDATE wireless_blocks SET
-                                   sample_hits=?, sample_total=?, numbers_checked=?,
-                                   numbers_found=?, status=?, updated_at=datetime('now')
-                                   WHERE npa=? AND nxx=? AND block=?""",
-                                (hits, sample_size, sample_size, hits, new_status, b_npa, b_nxx, b_blk),
-                            )
-
-                    db.commit()
-
-                # Update sampler.stats
-                sampler.stats["numbers_checked"] += sample_size
-                sampler.stats["numbers_found"] += hits
-                if hits > 0:
-                    sampler.stats["blocks_sweeping"] += 1
-                    sampler.stats["queries_saved"] += 0
-                else:
-                    sampler.stats["blocks_skipped"] += 1
-                    sampler.stats["queries_saved"] += 980
-                sampler.stats["current_device"] = device_id
-
-                log.info(
-                    f"seed_probes_if_empty: seeded {inserted_probes} probes for NPA {npa_target} "
-                    f"from {seed_path} (hits={hits}, device={device_id}, "
-                    f"block={block_sampled}, status={new_status if block_sampled else 'N/A'})"
-                )
-                return inserted_probes
+                probes = payload.get("probes", payload) if isinstance(payload, dict) else payload
+                device_id = payload.get("device_id", "spare_1") if isinstance(payload, dict) else "spare_1"
+                phone_number = payload.get("phone_number", "19292718201") if isinstance(payload, dict) else "19292718201"
+                if probes:
+                    res = apply_probes_to_db(probes, device_id=device_id, phone_number=phone_number)
+                    log.info(f"Auto-seeded {res['inserted']} probes for NPA {npa_target} from {seed_path}: {res}")
+                    return res["inserted"]
             except Exception as e:
-                log.warning(f"seed_probes_if_empty: failed reading {seed_path}: {e}")
+                log.warning(f"Failed reading probes seed file {seed_path}: {e}")
     return 0
 
 
@@ -955,8 +947,7 @@ class BlockSampler:
             elif block["status"] == "ACTIVE_SWEEPING":
                 made_call = await self._probe_one_sweep(block, device, db)
 
-            if made_call:
-                real_work_done = True
+            if made_call:\n                real_work_done = True
                 self._update_daily_counter(device["device_id"], db)
                 self.stats["numbers_checked"] += 1
 
@@ -1222,16 +1213,14 @@ async def _keep_alive_loop():
 
 
 async def _startup_auto_seed():
-    """Ensure TARGET_NPA (default 732) blocks and probes are present on startup and sync local devices to GOWA."""
+    """Ensure TARGET_NPA (default 732) blocks & probes are present on startup and sync devices to GOWA."""
     try:
         npa = TARGET_NPA or "732"
         seeded = seed_from_json_if_empty(npa)
         if seeded == 0:
             log.info(f"No blocks found for NPA {npa} on startup — auto-ingesting from NANPA...")
             await asyncio.to_thread(ingest_nanpa_data_sync, npa)
-        # v3.4.0: seed Phase A probe results from backups/npa_732_probes_seed.json
-        probes_seeded = seed_probes_if_empty(npa)
-        log.info(f"Startup auto-seed: {probes_seeded} probes seeded for NPA {npa}")
+        seed_probes_if_empty(npa)
         db = get_db()
         rows = db.execute("SELECT device_id FROM gowa_devices").fetchall()
         for r in rows:
@@ -1275,14 +1264,18 @@ async def health():
     try:
         db = get_db()
         count = db.execute("SELECT COUNT(*) as c FROM wireless_blocks").fetchone()["c"]
+        probes = db.execute("SELECT COUNT(*) as c FROM number_probes").fetchone()["c"]
+        wa_hits = db.execute("SELECT COUNT(*) as c FROM number_probes WHERE is_on_whatsapp=1").fetchone()["c"]
         return {
             "status": "ok",
             "version": "3.4.0",
             "blocks_loaded": count,
+            "numbers_probed": probes,
+            "whatsapp_found": wa_hits,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
     except Exception as e:
-        return JSONResponse({"status": "error", "detail": str(e)}, status_code=503)
+        return JSONResponse({"status": "error", "detail\": str(e)}, status_code=503)
 
 @app.get("/", response_class=HTMLResponse)
 async def dashboard():
@@ -1298,7 +1291,7 @@ async def get_csrf_token(username: str = Depends(verify_credentials)):
 
 @app.get("/api/backup/status")
 async def backup_status(npa: str = Query("732")):
-    """Snapshot status metadata for public NANPA wireless_blocks."""
+    """Snapshot status metadata for public NANPA wireless_blocks and Phase A probes."""
     db = get_db()
     total = db.execute(
         "SELECT COUNT(*) as c FROM wireless_blocks WHERE npa = ?", (npa,)
@@ -1310,15 +1303,80 @@ async def backup_status(npa: str = Query("732")):
             (npa,),
         ).fetchall()
     }
+    by_status = {
+        r["status"]: r["c"]
+        for r in db.execute(
+            "SELECT status, COUNT(*) as c FROM wireless_blocks WHERE npa = ? GROUP BY status",
+            (npa,),
+        ).fetchall()
+    }
+    probes_total = db.execute(
+        "SELECT COUNT(*) as c FROM number_probes WHERE npa = ?", (npa,)
+    ).fetchone()["c"]
+    wa_found = db.execute(
+        "SELECT COUNT(*) as c FROM number_probes WHERE npa = ? AND is_on_whatsapp = 1", (npa,)
+    ).fetchone()["c"]
     return {
         "status": "ok",
         "version": "3.4.0",
         "npa": npa,
         "total_wireless_blocks": total,
         "by_source": by_source,
+        "by_status": by_status,
+        "numbers_probed": probes_total,
+        "whatsapp_found": wa_found,
+        "queries_saved": sampler.stats["queries_saved"],
         "keep_alive_interval_s": KEEP_ALIVE_INTERVAL,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
+
+@app.get("/api/backup/probes")
+async def backup_probes(
+    npa: str = Query("732"),
+    format: str = Query("json", pattern="^(json|csv)$"),
+):
+    """Export number_probes table for npa as JSON or CSV."""
+    db = get_db()
+    rows = [
+        dict(r) for r in db.execute(
+            "SELECT phone, npa, nxx, block, is_on_whatsapp, device_id, probed_at "
+            "FROM number_probes WHERE npa = ? ORDER BY phone ASC",
+            (npa,),
+        ).fetchall()
+    ]
+    if format == "csv":
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(["phone", "npa", "nxx", "block", "is_on_whatsapp", "device_id", "probed_at"])
+        for r in rows:
+            writer.writerow([
+                r["phone"], r["npa"], r["nxx"], r["block"],
+                r["is_on_whatsapp"], r["device_id"] or "", r["probed_at"] or "",
+            ])
+        output.seek(0)
+        return StreamingResponse(
+            iter([output.getvalue()]),
+            media_type="text/csv",
+            headers={"Content-Disposition": f"attachment; filename=npa_{npa}_probes.csv"},
+        )
+    wa_hits = [r for r in rows if r["is_on_whatsapp"] == 1]
+    return {
+        "npa": npa,
+        "version": "3.4.0",
+        "total_probed": len(rows),
+        "whatsapp_found": len(wa_hits),
+        "whatsapp_numbers": [r["phone"] for r in wa_hits],
+        "probes": rows,
+    }
+
+@app.post("/api/probes/import")
+async def import_probes(request: Request, username: str = Depends(verify_csrf)):
+    body = await request.json()
+    probes = body.get("probes", [])
+    device_id = body.get("device_id", "spare_1")
+    phone_number = body.get("phone_number", "19292718201")
+    res = apply_probes_to_db(probes, device_id=device_id, phone_number=phone_number)
+    return {"status": "ok", **res}
 
 @app.get("/api/backup/blocks")
 async def backup_blocks(
@@ -1362,47 +1420,6 @@ async def backup_blocks(
         "blocks": rows,
     }
 
-@app.get("/api/backup/probes")
-async def backup_probes(
-    npa: str = Query("732"),
-    format: str = Query("json", pattern="^(json|csv)$"),
-):
-    """v3.4.0: Export number_probes for a given NPA as JSON or CSV (no auth, matching /api/backup/status)."""
-    db = get_db()
-    rows = [
-        dict(r) for r in db.execute(
-            "SELECT phone, npa, nxx, block, is_on_whatsapp, device_id, probed_at, error "
-            "FROM number_probes WHERE npa = ? ORDER BY probed_at DESC",
-            (npa,),
-        ).fetchall()
-    ]
-    total_wa = sum(1 for r in rows if r["is_on_whatsapp"])
-    total_probes = len(rows)
-
-    if format == "csv":
-        output = io.StringIO()
-        writer = csv.writer(output)
-        writer.writerow(["phone", "npa", "nxx", "block", "is_on_whatsapp", "device_id", "probed_at", "error"])
-        for r in rows:
-            writer.writerow([
-                r["phone"], r["npa"], r["nxx"], r["block"],
-                r["is_on_whatsapp"], r["device_id"] or "", r["probed_at"] or "", r["error"] or "",
-            ])
-        output.seek(0)
-        return StreamingResponse(
-            iter([output.getvalue()]),
-            media_type="text/csv",
-            headers={"Content-Disposition": f"attachment; filename=npa_{npa}_probes.csv"},
-        )
-    return {
-        "npa": npa,
-        "version": "3.4.0",
-        "total_probes": total_probes,
-        "whatsapp_found": total_wa,
-        "exported_at": datetime.now(timezone.utc).isoformat(),
-        "probes": rows,
-    }
-
 @app.get("/api/stats")
 async def get_stats(username: str = Depends(verify_credentials)):
     db = get_db()
@@ -1428,6 +1445,12 @@ async def get_stats(username: str = Depends(verify_credentials)):
     ).fetchall()
     return {
         **sampler.stats,
+        "numbers_checked": total_probes,
+        "numbers_found": wa_found,
+        "blocks_skipped": dormant,
+        "blocks_sweeping": sweeping,
+        "blocks_complete": complete,
+        "queries_saved": dormant * (1000 - SAMPLE_SIZE),
         "sampler_running": sampler.running,
         "db_blocks_total": total_blocks, "db_blocks_pending": pending,
         "db_blocks_dormant": dormant, "db_blocks_sweeping": sweeping,
@@ -1463,7 +1486,7 @@ async def list_blocks(
         query += " AND npa = ?"; params.append(npa)
     if status:
         query += " AND status = ?"; params.append(status)
-    query += " ORDER BY id ASC LIMIT ? OFFSET ?"
+    query += " ORDER BY CASE status WHEN 'ACTIVE_SWEEPING' THEN 0 WHEN 'DORMANT_SKIPPED' THEN 1 ELSE 2 END, id ASC LIMIT ? OFFSET ?"
     params.extend([limit, offset])
     rows = db.execute(query, params).fetchall()
     total = db.execute(
@@ -1485,7 +1508,7 @@ async def list_numbers(
         query += " AND is_on_whatsapp = ?"; params.append(is_on_whatsapp)
     if npa:
         query += " AND npa = ?"; params.append(npa)
-    query += " ORDER BY id DESC LIMIT ? OFFSET ?"
+    query += " ORDER BY is_on_whatsapp DESC, id DESC LIMIT ? OFFSET ?"
     params.extend([limit, offset])
     rows = db.execute(query, params).fetchall()
     return {"numbers": [dict(r) for r in rows], "limit": limit, "offset": offset}
