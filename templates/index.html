@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>WhatsApp Number Miner v3</title>
     <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://accounts.google.com/gsi/client" async defer></script>
     <script>
         tailwind.config = {
             darkMode: 'class',
@@ -46,8 +47,10 @@
         <div id="authModal" class="hidden fixed inset-0 bg-black/70 flex items-center justify-center z-50">
             <div class="bg-gray-900 border border-gray-700 rounded-xl p-6 w-96 fade-in">
                 <h2 class="text-lg font-bold mb-4">Authentication</h2>
+                <input id="emailInput" type="email" placeholder="Email (e.g. yikusiel@gmail.com)" value="Yikusiel@gmail.com" class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm mb-3 focus:outline-none focus:border-brand-500">
                 <input id="passwordInput" type="password" placeholder="Password" class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm mb-3 focus:outline-none focus:border-brand-500">
                 <button onclick="doLogin()" class="w-full py-2 bg-brand-600 hover:bg-brand-700 rounded-lg text-sm font-medium transition">Login</button>
+                <div id="googleSignInContainer" class="mt-3 flex justify-center"></div>
                 <p id="authError" class="text-red-400 text-xs mt-2 hidden"></p>
             </div>
         </div>
@@ -245,14 +248,81 @@
 
         async function doLogin() {
             const pw = document.getElementById('passwordInput').value;
+            const email = document.getElementById('emailInput').value.trim().toLowerCase();
+            if (!pw) { showAuthError('Password is required'); return; }
+            if (email && email !== 'yikusiel@gmail.com') { showAuthError('Access restricted to yikusiel@gmail.com'); return; }
             token = pw;
             localStorage.setItem('miner_token', pw);
             document.getElementById('authModal').classList.add('hidden');
+            setAuthenticatedUI();
+            await fetchCsrfToken();
+            refreshAll();
+        }
+
+        function showAuthError(msg) {
+            const el = document.getElementById('authError');
+            el.textContent = msg;
+            el.classList.remove('hidden');
+        }
+
+        function setAuthenticatedUI() {
             document.getElementById('loginBtn').textContent = '✓ Authenticated';
             document.getElementById('loginBtn').classList.remove('bg-brand-600', 'hover:bg-brand-700');
             document.getElementById('loginBtn').classList.add('bg-green-700');
-            await fetchCsrfToken();
-            refreshAll();
+        }
+
+        // ── Google Sign-In ──────────────────────────────────────────────────
+        async function initGoogleSignIn() {
+            try {
+                const resp = await fetch('/api/auth/config');
+                const config = await resp.json();
+                if (!config.google_client_id) {
+                    // No Google Client ID configured — hide the container
+                    document.getElementById('googleSignInContainer').innerHTML =
+                        '<p class="text-xs text-gray-600">Google Sign-In not configured yet</p>';
+                    return;
+                }
+                // Wait for Google's library to load
+                if (typeof google === 'undefined' || !google.accounts) {
+                    setTimeout(initGoogleSignIn, 500);
+                    return;
+                }
+                google.accounts.id.initialize({
+                    client_id: config.google_client_id,
+                    callback: handleGoogleCredential,
+                    auto_select: false,
+                });
+                google.accounts.id.renderButton(
+                    document.getElementById('googleSignInContainer'),
+                    { theme: 'filled_black', size: 'large', text: 'signin_with', width: 280 }
+                );
+            } catch(e) {
+                console.error('Google Sign-In init failed:', e);
+            }
+        }
+
+        async function handleGoogleCredential(response) {
+            try {
+                const res = await fetch('/api/auth/google', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ credential: response.credential }),
+                });
+                if (!res.ok) {
+                    const err = await res.json();
+                    showAuthError(err.detail || 'Google sign-in failed');
+                    return;
+                }
+                const data = await res.json();
+                token = data.token;
+                csrfToken = data.csrf_token;
+                localStorage.setItem('miner_token', token);
+                document.getElementById('authModal').classList.add('hidden');
+                setAuthenticatedUI();
+                refreshAll();
+            } catch(e) {
+                showAuthError('Google sign-in error: ' + e.message);
+            }
         }
 
         async function api(path, opts = {}) {
@@ -621,12 +691,12 @@
             else if (currentTab === 'ocn') loadOCNOverrides();
         }
 
+        // ── Startup ─────────────────────────────────────────────────────────
         if (token) {
-            document.getElementById('loginBtn').textContent = '✓ Authenticated';
-            document.getElementById('loginBtn').classList.remove('bg-brand-600', 'hover:bg-brand-700');
-            document.getElementById('loginBtn').classList.add('bg-green-700');
+            setAuthenticatedUI();
             fetchCsrfToken();
         }
+        initGoogleSignIn();
         refreshAll();
         setInterval(refreshStats, 10000);
     </script>

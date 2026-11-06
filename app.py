@@ -21,6 +21,12 @@ FIXES APPLIED (v3.4.2):
   5. apply_probes_to_db now persists merged probes to npa_<NPA>_probes_seed.json on disk.
   6. list_devices now shows "connected (spare_gateway)" for disconnected GOWA devices
      that have daily_checks > 0 in the local DB.
+
+v3.5.0:
+  7. Google OAuth: "Sign in with Google" restricted to ALLOWED_EMAIL.
+     GET /api/auth/config returns GOOGLE_CLIENT_ID + allowed_email.
+     POST /api/auth/google verifies Google ID token and returns auth token.
+  8. Email+password login: email field in auth modal, verified against ALLOWED_EMAIL.
 """
 
 import asyncio
@@ -32,6 +38,7 @@ import logging
 import os
 import random
 import re
+import secrets
 import sqlite3
 import tempfile
 import threading
@@ -48,7 +55,7 @@ from fastapi import FastAPI, HTTPException, Request, Depends, Query
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
-# ── Config ──────────────────���───────────────────────────────────────────────
+# ── Config ──────────────────────────────────────────────────────────────────
 APP_KEY = os.getenv("APP_PASSWORD", "")
 GOWA_URL = os.getenv("GOWA_URL", "http://127.0.0.1:3000")
 GOWA_CREDS = os.getenv("GOWA_BASIC_AUTH", "")
@@ -56,6 +63,8 @@ DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:////app/data/miner.db")
 TARGET_NPA = os.getenv("TARGET_NPA", "732") or "732"
 KEEP_ALIVE_URL = os.getenv("RENDER_EXTERNAL_URL", "https://whatsapp-number-miner.onrender.com")
 KEEP_ALIVE_INTERVAL = int(os.getenv("KEEP_ALIVE_INTERVAL", "480"))  # 8 minutes
+ALLOWED_EMAIL = os.getenv("ALLOWED_EMAIL", "yikusiel@gmail.com").lower().strip()
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "").strip()
 
 if not APP_KEY:
     raise RuntimeError("APP_PASSWORD environment variable is required")
@@ -454,7 +463,6 @@ security = HTTPBasic(auto_error=False)
 def verify_credentials(credentials: HTTPBasicCredentials = Depends(security)):
     if not credentials:
         raise HTTPException(status_code=401, detail="Authentication required")
-    import secrets
     if not secrets.compare_digest(credentials.password, APP_KEY):
         raise HTTPException(status_code=401, detail="Invalid credentials")
     return credentials.username
@@ -480,7 +488,6 @@ def verify_csrf(
 
 
 def generate_csrf_token() -> str:
-    import secrets
     token = secrets.token_urlsafe(32)
     db = get_db()
     with _db_lock:
@@ -491,6 +498,34 @@ def generate_csrf_token() -> str:
         )
         db.commit()
     return token
+
+
+# ── Google OAuth ────────────────────────────────────────────────────────────
+
+async def verify_google_id_token(credential: str) -> dict:
+    """Verify a Google ID token and return the payload dict, or raise HTTPException."""
+    verify_url = f"https://oauth2.googleapis.com/tokeninfo?id_token={credential}"
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        resp = await client.get(verify_url)
+        if resp.status_code != 200:
+            raise HTTPException(status_code=401, detail="Invalid Google ID token")
+        payload = resp.json()
+
+    email = (payload.get("email") or "").lower().strip()
+    email_verified = str(payload.get("email_verified", "")).lower()
+
+    if email_verified != "true":
+        raise HTTPException(status_code=401, detail="Google email not verified")
+
+    if email != ALLOWED_EMAIL:
+        raise HTTPException(status_code=403, detail=f"Access restricted to {ALLOWED_EMAIL}")
+
+    if GOOGLE_CLIENT_ID:
+        aud = payload.get("aud", "")
+        if aud != GOOGLE_CLIENT_ID:
+            raise HTTPException(status_code=401, detail="Invalid audience (client ID mismatch)")
+
+    return {"email": email, "name": payload.get("name", ""), "picture": payload.get("picture", "")}
 
 
 # ── GOWA Client ─────────────────────────────────────────────────────────────
@@ -575,7 +610,6 @@ class GowaClient:
             }
         except httpx.HTTPStatusError as e:
             status = e.response.status_code
-            # Catch ALL HTTP statuses — caller decides which are rate-limit vs fatal
             return {
                 "is_on_whatsapp": False,
                 "error": f"HTTP_{status}",
@@ -1043,13 +1077,10 @@ class BlockSampler:
 
         if result.get("error"):
             error_code = result["error"]
-            # Rate-limit / auth errors: trigger cooldown, return True (call was made)
             if error_code in ("HTTP_429", "HTTP_463", "HTTP_401", "HTTP_403"):
                 self._trigger_cooldown(device["device_id"], db)
                 self.stats["last_error"] = error_code
                 return True
-            # ALL OTHER errors (HTTP_400, HTTP_500, connection errors, etc.):
-            # do NOT insert a false-negative row — just log and return False
             self.stats["last_error"] = error_code
             log.warning(f"Non-rate-limit error probing {phone}: {error_code} — skipping insert")
             return False
@@ -1143,12 +1174,10 @@ class BlockSampler:
 
         if result.get("error"):
             error_code = result["error"]
-            # Rate-limit / auth errors: trigger cooldown, return True (call was made)
             if error_code in ("HTTP_429", "HTTP_463", "HTTP_401", "HTTP_403"):
                 self._trigger_cooldown(device["device_id"], db)
                 self.stats["last_error"] = error_code
                 return True
-            # ALL OTHER errors: do NOT insert a false-negative row
             self.stats["last_error"] = error_code
             log.warning(f"Non-rate-limit error probing {phone}: {error_code} — skipping insert")
             return False
@@ -1307,7 +1336,7 @@ def _load_html_template() -> str:
         _HTML_TEMPLATE = "<html><body><h1>WhatsApp Number Miner</h1><p>Template not found</p></body></html>"
     return _HTML_TEMPLATE
 
-# ── FastAPI App ─────��───────────────────────────────────────────────────────
+# ── FastAPI App ─────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
@@ -1319,7 +1348,7 @@ async def lifespan(app: FastAPI):
     await sampler.stop()
     await gowa.close()
 
-app = FastAPI(title="WhatsApp Number Miner", version="3.4.2", lifespan=lifespan)
+app = FastAPI(title="WhatsApp Number Miner", version="3.5.0", lifespan=lifespan)
 
 # ── Routes ──────────────────────────────────────────────────────────────────
 
@@ -1332,7 +1361,7 @@ async def health():
         wa_hits = db.execute("SELECT COUNT(*) as c FROM number_probes WHERE is_on_whatsapp=1").fetchone()["c"]
         return {
             "status": "ok",
-            "version": "3.4.2",
+            "version": "3.5.0",
             "blocks_loaded": count,
             "numbers_probed": probes,
             "whatsapp_found": wa_hits,
@@ -1348,6 +1377,38 @@ async def dashboard():
     response = HTMLResponse(content=html)
     response.set_cookie(key="csrf_token", value=csrf, httponly=True, samesite="lax")
     return response
+
+# ── Google OAuth Endpoints (unauthenticated) ────────────────────────────────
+
+@app.get("/api/auth/config")
+async def auth_config():
+    """Return OAuth config for the frontend (no auth required)."""
+    return {
+        "google_client_id": GOOGLE_CLIENT_ID,
+        "allowed_email": ALLOWED_EMAIL,
+    }
+
+
+@app.post("/api/auth/google")
+async def auth_google(request: Request):
+    """Verify a Google ID token and return an auth token + CSRF token."""
+    body = await request.json()
+    credential = (body or {}).get("credential", "")
+    if not credential:
+        raise HTTPException(status_code=400, detail="Missing credential")
+
+    user_info = await verify_google_id_token(credential)
+    csrf = generate_csrf_token()
+
+    return {
+        "status": "ok",
+        "email": user_info["email"],
+        "name": user_info.get("name", ""),
+        "picture": user_info.get("picture", ""),
+        "token": APP_KEY,
+        "csrf_token": csrf,
+    }
+
 
 @app.get("/api/csrf-token")
 async def get_csrf_token(username: str = Depends(verify_credentials)):
@@ -1382,7 +1443,7 @@ async def backup_status(npa: str = Query("732")):
     ).fetchone()["c"]
     return {
         "status": "ok",
-        "version": "3.4.2",
+        "version": "3.5.0",
         "npa": npa,
         "total_wireless_blocks": total,
         "by_source": by_source,
@@ -1426,7 +1487,7 @@ async def backup_probes(
     wa_hits = [r for r in rows if r["is_on_whatsapp"] == 1]
     return {
         "npa": npa,
-        "version": "3.4.2",
+        "version": "3.5.0",
         "total_probes": len(rows),
         "total_probed": len(rows),
         "whatsapp_found": len(wa_hits),
@@ -1479,7 +1540,7 @@ async def backup_blocks(
         )
     return {
         "npa": npa,
-        "version": "3.4.2",
+        "version": "3.5.0",
         "total": len(rows),
         "exported_at": datetime.now(timezone.utc).isoformat(),
         "blocks": rows,
@@ -1619,14 +1680,12 @@ async def list_devices(username: str = Depends(verify_credentials)):
     ]
     gowa_devices = await gowa.get_devices()
 
-    # Build lookup of GOWA device states by device_id
     gowa_by_id = {}
     for gd in gowa_devices:
         if isinstance(gd, dict):
             did = gd.get("id") or gd.get("device_id") or ""
             gowa_by_id[did] = gd
 
-    # Merge: if GOWA shows disconnected but local DB has daily_checks > 0, mark as spare_gateway
     for ld in local:
         did = ld.get("device_id", "")
         gd = gowa_by_id.get(did, {})
