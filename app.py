@@ -300,7 +300,6 @@ def apply_probes_to_db(probes: list, device_id: str = "spare_1", phone_number: s
             inserted += 1
             by_block[(npa, nxx, blk)].append(is_wa)
 
-        # Ensure spare_1 is registered in gowa_devices with updated daily_checks
         total_probes = db.execute("SELECT COUNT(*) as c FROM number_probes WHERE device_id = ?", (device_id,)).fetchone()["c"]
         existing_dev = db.execute("SELECT * FROM gowa_devices WHERE device_id = ?", (device_id,)).fetchone()
         if existing_dev:
@@ -318,7 +317,6 @@ def apply_probes_to_db(probes: list, device_id: str = "spare_1", phone_number: s
                 (device_id, phone_number, total_probes, today),
             )
 
-        # Recompute block stats for every touched block
         for (npa, nxx, blk) in by_block.keys():
             total_blk = db.execute(
                 "SELECT COUNT(*) as c FROM number_probes WHERE npa=? AND nxx=? AND block=?",
@@ -342,7 +340,6 @@ def apply_probes_to_db(probes: list, device_id: str = "spare_1", phone_number: s
             )
         db.commit()
 
-    # Sync in-memory sampler.stats from DB so dashboard cards reflect true totals
     total_checked = db.execute("SELECT COUNT(*) as c FROM number_probes").fetchone()["c"]
     total_found = db.execute("SELECT COUNT(*) as c FROM number_probes WHERE is_on_whatsapp=1").fetchone()["c"]
     blocks_skipped = db.execute("SELECT COUNT(*) as c FROM wireless_blocks WHERE status='DORMANT_SKIPPED'").fetchone()["c"]
@@ -947,7 +944,8 @@ class BlockSampler:
             elif block["status"] == "ACTIVE_SWEEPING":
                 made_call = await self._probe_one_sweep(block, device, db)
 
-            if made_call:\n                real_work_done = True
+            if made_call:
+                real_work_done = True
                 self._update_daily_counter(device["device_id"], db)
                 self.stats["numbers_checked"] += 1
 
@@ -1275,7 +1273,7 @@ async def health():
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
     except Exception as e:
-        return JSONResponse({"status": "error", "detail\": str(e)}, status_code=503)
+        return JSONResponse({"status": "error", "detail": str(e)}, status_code=503)
 
 @app.get("/", response_class=HTMLResponse)
 async def dashboard():
@@ -1300,8 +1298,7 @@ async def backup_status(npa: str = Query("732")):
         r["source"]: r["c"]
         for r in db.execute(
             "SELECT source, COUNT(*) as c FROM wireless_blocks WHERE npa = ? GROUP BY source",
-            (npa,),
-        ).fetchall()
+            (npa,),\n        ).fetchall()
     }
     by_status = {
         r["status"]: r["c"]
@@ -1452,8 +1449,7 @@ async def get_stats(username: str = Depends(verify_credentials)):
         "blocks_complete": complete,
         "queries_saved": dormant * (1000 - SAMPLE_SIZE),
         "sampler_running": sampler.running,
-        "db_blocks_total": total_blocks, "db_blocks_pending": pending,
-        "db_blocks_dormant": dormant, "db_blocks_sweeping": sweeping,
+        "db_blocks_total": total_blocks, "db_blocks_pending": pending,\n        "db_blocks_dormant": dormant, "db_blocks_sweeping": sweeping,
         "db_blocks_complete": complete, "db_whatsapp_found": wa_found,
         "db_total_probes": total_probes,
         "devices": [dict(d) for d in devices],
